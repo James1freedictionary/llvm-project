@@ -121,7 +121,6 @@ class Class2 {
 
 typedef Class1<Class2> Type1;
 
-// rdar : // 8307865
 struct CodeCompleteConsumer {
 };
 
@@ -194,12 +193,9 @@ namespace PR15017 {
 }
 
 // Ensure we produce at least some diagnostic for attributes in C++98.
-[[]] struct S;
-#if __cplusplus <= 199711L
-// expected-error@-2 {{expected expression}}
-// expected-error@-3 {{expected unqualified-id}}
-#else
-// expected-error@-5 {{misplaced attributes}}
+[[]] struct S; // expected-error {{misplaced attributes}}
+#if __cplusplus < 201103L
+// expected-error@-2 {{[[]] attributes are a C++11 extension}}
 #endif
 
 namespace test7 {
@@ -256,9 +252,6 @@ namespace DuplicateFriend {
   struct A {
     friend void friend f(); // expected-warning {{duplicate 'friend' declaration specifier}}
     friend struct B friend; // expected-warning {{duplicate 'friend' declaration specifier}}
-#if __cplusplus >= 201103L
-    // expected-error@-2 {{'friend' must appear first in a non-function declaration}}
-#endif
   };
 }
 

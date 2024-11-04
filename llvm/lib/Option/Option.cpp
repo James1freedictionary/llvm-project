@@ -6,19 +6,18 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Option/Option.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
-#include "llvm/Option/Option.h"
 #include "llvm/Option/OptTable.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
-#include <cstring>
 
 using namespace llvm;
 using namespace llvm::opt;
@@ -38,7 +37,7 @@ Option::Option(const OptTable::Info *info, const OptTable *owner)
   }
 }
 
-void Option::print(raw_ostream &O) const {
+void Option::print(raw_ostream &O, bool AddNewLine) const {
   O << "<";
   switch (getKind()) {
 #define P(N) case N: O << #N; break
@@ -70,19 +69,21 @@ void Option::print(raw_ostream &O) const {
   const Option Group = getGroup();
   if (Group.isValid()) {
     O << " Group:";
-    Group.print(O);
+    Group.print(O, /*AddNewLine=*/false);
   }
 
   const Option Alias = getAlias();
   if (Alias.isValid()) {
     O << " Alias:";
-    Alias.print(O);
+    Alias.print(O, /*AddNewLine=*/false);
   }
 
   if (getKind() == MultiArgClass)
     O << " NumArgs:" << getNumArgs();
 
-  O << ">\n";
+  O << ">";
+  if (AddNewLine)
+    O << "\n";
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)

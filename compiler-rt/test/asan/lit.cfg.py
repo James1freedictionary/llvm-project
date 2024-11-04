@@ -10,48 +10,13 @@ import lit.formats
 
 def get_required_attr(config, attr_name):
     attr_value = getattr(config, attr_name, None)
-    if attr_value == None:
+    if attr_value is None:
         lit_config.fatal(
             "No attribute %r in test configuration! You may need to run "
             "tests from your build directory or add this attribute "
             "to lit.site.cfg.py " % attr_name
         )
     return attr_value
-
-
-def push_dynamic_library_lookup_path(config, new_path):
-    if platform.system() == "Windows":
-        dynamic_library_lookup_var = "PATH"
-    elif platform.system() == "Darwin":
-        dynamic_library_lookup_var = "DYLD_LIBRARY_PATH"
-    else:
-        dynamic_library_lookup_var = "LD_LIBRARY_PATH"
-
-    new_ld_library_path = os.path.pathsep.join(
-        (new_path, config.environment.get(dynamic_library_lookup_var, ""))
-    )
-    config.environment[dynamic_library_lookup_var] = new_ld_library_path
-
-    if platform.system() == "FreeBSD":
-        dynamic_library_lookup_var = "LD_32_LIBRARY_PATH"
-        new_ld_32_library_path = os.path.pathsep.join(
-            (new_path, config.environment.get(dynamic_library_lookup_var, ""))
-        )
-        config.environment[dynamic_library_lookup_var] = new_ld_32_library_path
-
-    if platform.system() == "SunOS":
-        dynamic_library_lookup_var = "LD_LIBRARY_PATH_32"
-        new_ld_library_path_32 = os.path.pathsep.join(
-            (new_path, config.environment.get(dynamic_library_lookup_var, ""))
-        )
-        config.environment[dynamic_library_lookup_var] = new_ld_library_path_32
-
-        dynamic_library_lookup_var = "LD_LIBRARY_PATH_64"
-        new_ld_library_path_64 = os.path.pathsep.join(
-            (new_path, config.environment.get(dynamic_library_lookup_var, ""))
-        )
-        config.environment[dynamic_library_lookup_var] = new_ld_library_path_64
-
 
 # Setup config name.
 config.name = "AddressSanitizer" + config.name_suffix
@@ -136,14 +101,24 @@ if platform.system() == "Windows":
     config.available_features.add(win_runtime_feature)
 
 
-def build_invocation(compile_flags):
-    return " " + " ".join([config.clang] + compile_flags) + " "
+def build_invocation(compile_flags, with_lto=False):
+    lto_flags = []
+    if with_lto and config.lto_supported:
+        lto_flags += config.lto_flags
+
+    return " " + " ".join([config.clang] + lto_flags + compile_flags) + " "
 
 
 config.substitutions.append(("%clang ", build_invocation(target_cflags)))
 config.substitutions.append(("%clangxx ", build_invocation(target_cxxflags)))
 config.substitutions.append(("%clang_asan ", build_invocation(clang_asan_cflags)))
 config.substitutions.append(("%clangxx_asan ", build_invocation(clang_asan_cxxflags)))
+config.substitutions.append(
+    ("%clang_asan_lto ", build_invocation(clang_asan_cflags, True))
+)
+config.substitutions.append(
+    ("%clangxx_asan_lto ", build_invocation(clang_asan_cxxflags, True))
+)
 if config.asan_dynamic:
     if config.host_os in ["Linux", "FreeBSD", "NetBSD", "SunOS"]:
         shared_libasan_path = os.path.join(
@@ -154,6 +129,11 @@ if config.asan_dynamic:
         shared_libasan_path = os.path.join(
             config.compiler_rt_libdir,
             "libclang_rt.asan_{}_dynamic.dylib".format(config.apple_platform),
+        )
+    elif config.host_os == "Windows":
+        shared_libasan_path = os.path.join(
+            config.compiler_rt_libdir,
+            "clang_rt.asan_dynamic-{}.lib".format(config.target_suffix),
         )
     else:
         lit_config.warning(
@@ -173,12 +153,16 @@ if config.asan_dynamic:
 if platform.system() == "Windows":
     # MSVC-specific tests might also use the clang-cl.exe driver.
     if target_is_msvc:
-        clang_cl_cxxflags = [
-            "-Wno-deprecated-declarations",
-            "-WX",
-            "-D_HAS_EXCEPTIONS=0",
-            "-Zi",
-        ] + target_cflags
+        clang_cl_cxxflags = (
+            [
+                "-WX",
+                "-D_HAS_EXCEPTIONS=0",
+            ]
+            + config.debug_info_flags
+            + target_cflags
+        )
+        if config.compiler_id != "MSVC":
+            clang_cl_cxxflags = ["-Wno-deprecated-declarations"] + clang_cl_cxxflags
         clang_cl_asan_cxxflags = ["-fsanitize=address"] + clang_cl_cxxflags
         if config.asan_dynamic:
             clang_cl_asan_cxxflags.append("-MD")
@@ -203,8 +187,22 @@ if platform.system() == "Windows":
         base_lib = os.path.join(
             config.compiler_rt_libdir, "clang_rt.asan%%s%s.lib" % config.target_suffix
         )
-        config.substitutions.append(("%asan_lib", base_lib % ""))
+        config.substitutions.append(("%asan_lib", base_lib % "_dynamic"))
+        if config.asan_dynamic:
+            config.substitutions.append(
+                ("%asan_thunk", base_lib % "_dynamic_runtime_thunk")
+            )
+        else:
+            config.substitutions.append(
+                ("%asan_thunk", base_lib % "_static_runtime_thunk")
+            )
         config.substitutions.append(("%asan_cxx_lib", base_lib % "_cxx"))
+        config.substitutions.append(
+            ("%asan_dynamic_runtime_thunk", base_lib % "_dynamic_runtime_thunk")
+        )
+        config.substitutions.append(
+            ("%asan_static_runtime_thunk", base_lib % "_static_runtime_thunk")
+        )
         config.substitutions.append(("%asan_dll_thunk", base_lib % "_dll_thunk"))
     else:
         # To make some of these tests work on MinGW target without changing their
@@ -285,20 +283,17 @@ if (
 ):
     config.available_features.add("leak-detection")
 
-# Set LD_LIBRARY_PATH to pick dynamic runtime up properly.
-push_dynamic_library_lookup_path(config, config.compiler_rt_libdir)
-
-# GCC-ASan uses dynamic runtime by default.
-if config.compiler_id == "GNU":
-    gcc_dir = os.path.dirname(config.clang)
-    libasan_dir = os.path.join(gcc_dir, "..", "lib" + config.bits)
-    push_dynamic_library_lookup_path(config, libasan_dir)
-
 # Add the RT libdir to PATH directly so that we can successfully run the gtest
 # binary to list its tests.
-if config.host_os == "Windows" and config.asan_dynamic:
+if config.host_os == "Windows":
     os.environ["PATH"] = os.path.pathsep.join(
         [config.compiler_rt_libdir, os.environ.get("PATH", "")]
+    )
+
+# msvc needs to be instructed where the compiler-rt libraries are
+if config.compiler_id == "MSVC":
+    config.environment["LIB"] = os.path.pathsep.join(
+        [config.compiler_rt_libdir, config.environment.get("LIB", "")]
     )
 
 # Default test suffixes.

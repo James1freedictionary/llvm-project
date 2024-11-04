@@ -32,6 +32,7 @@ namespace llvm {
 class Value;
 class APInt;
 class LLVMContext;
+template <typename T> class Expected;
 
 /// Class to represent integer types. Note that this class is also used to
 /// represent the built-in integer types: Int1Ty, Int8Ty, Int16Ty, Int32Ty and
@@ -132,7 +133,10 @@ public:
   }
 
   /// Parameter type accessors.
-  Type *getParamType(unsigned i) const { return ContainedTys[i+1]; }
+  Type *getParamType(unsigned i) const {
+    assert(i < getNumParams() && "getParamType() out of range!");
+    return ContainedTys[i + 1];
+  }
 
   /// Return the number of fixed parameters this function type requires.
   /// This does not consider varargs.
@@ -286,8 +290,8 @@ public:
   bool isSized(SmallPtrSetImpl<Type *> *Visited = nullptr) const;
 
   /// Returns true if this struct contains a scalable vector.
-  bool
-  containsScalableVectorType(SmallPtrSetImpl<Type *> *Visited = nullptr) const;
+  bool isScalableTy(SmallPtrSetImpl<const Type *> &Visited) const;
+  using Type::isScalableTy;
 
   /// Returns true if this struct contains homogeneous scalable vector types.
   /// Note that the definition of homogeneous scalable vector type is not
@@ -296,6 +300,10 @@ public:
   /// {{<vscale x 2 x i32>, <vscale x 4 x i64>},
   ///  {<vscale x 2 x i32>, <vscale x 4 x i64>}}
   bool containsHomogeneousScalableVectorTypes() const;
+
+  /// Return true if this struct is non-empty and all element types are the
+  /// same.
+  bool containsHomogeneousTypes() const;
 
   /// Return true if this is a named struct that has a non-empty name.
   bool hasName() const { return SymbolTableEntry != nullptr; }
@@ -488,9 +496,9 @@ public:
     return VectorType::get(EltTy, VTy->getElementCount());
   }
 
-  // This static method returns a VectorType with a smaller number of elements
-  // of a larger type than the input element type. For example, a <16 x i8>
-  // subdivided twice would return <4 x i32>
+  // This static method returns a VectorType with a larger number of elements
+  // of a smaller type than the input element type. For example, a <4 x i64>
+  // subdivided twice would return <16 x i16>
   static VectorType *getSubdividedVectorType(VectorType *VTy, int NumSubdivs) {
     for (int i = 0; i < NumSubdivs; ++i) {
       VTy = VectorType::getDoubleElementsVectorType(VTy);
@@ -628,7 +636,7 @@ public:
 
   /// Get the minimum number of elements in this vector. The actual number of
   /// elements in the vector is an integer multiple of this value.
-  uint64_t getMinNumElements() const { return ElementQuantity; }
+  unsigned getMinNumElements() const { return ElementQuantity; }
 
   static bool classof(const Type *T) {
     return T->getTypeID() == ScalableVectorTyID;
@@ -641,10 +649,7 @@ inline ElementCount VectorType::getElementCount() const {
 
 /// Class to represent pointers.
 class PointerType : public Type {
-  explicit PointerType(Type *ElType, unsigned AddrSpace);
   explicit PointerType(LLVMContext &C, unsigned AddrSpace);
-
-  Type *PointeeTy;
 
 public:
   PointerType(const PointerType &) = delete;
@@ -669,20 +674,6 @@ public:
     return PointerType::get(C, 0);
   }
 
-  /// This constructs a pointer type with the same pointee type as input
-  /// PointerType (or opaque pointer if the input PointerType is opaque) and the
-  /// given address space. This is only useful during the opaque pointer
-  /// transition.
-  /// TODO: remove after opaque pointer transition is complete.
-  static PointerType *getWithSamePointeeType(PointerType *PT,
-                                             unsigned AddressSpace) {
-    if (PT->isOpaque())
-      return get(PT->getContext(), AddressSpace);
-    return get(PT->PointeeTy, AddressSpace);
-  }
-
-  bool isOpaque() const { return !PointeeTy; }
-
   /// Return true if the specified type is valid as a element type.
   static bool isValidElementType(Type *ElemTy);
 
@@ -691,22 +682,6 @@ public:
 
   /// Return the address space of the Pointer type.
   inline unsigned getAddressSpace() const { return getSubclassData(); }
-
-  /// Return true if either this is an opaque pointer type or if this pointee
-  /// type matches Ty. Primarily used for checking if an instruction's pointer
-  /// operands are valid types. Will be useless after non-opaque pointers are
-  /// removed.
-  bool isOpaqueOrPointeeTypeMatches(Type *Ty) {
-    return isOpaque() || PointeeTy == Ty;
-  }
-
-  /// Return true if both pointer types have the same element type. Two opaque
-  /// pointers are considered to have the same element type, while an opaque
-  /// and a non-opaque pointer have different element types.
-  /// TODO: Remove after opaque pointer transition is complete.
-  bool hasSameElementTypeAs(PointerType *Other) {
-    return PointeeTy == Other->PointeeTy;
-  }
 
   /// Implement support type inquiry through isa, cast, and dyn_cast.
   static bool classof(const Type *T) {
@@ -762,8 +737,21 @@ public:
   /// Return a target extension type having the specified name and optional
   /// type and integer parameters.
   static TargetExtType *get(LLVMContext &Context, StringRef Name,
-                            ArrayRef<Type *> Types = std::nullopt,
-                            ArrayRef<unsigned> Ints = std::nullopt);
+                            ArrayRef<Type *> Types = {},
+                            ArrayRef<unsigned> Ints = {});
+
+  /// Return a target extension type having the specified name and optional
+  /// type and integer parameters, or an appropriate Error if it fails the
+  /// parameters check.
+  static Expected<TargetExtType *> getOrError(LLVMContext &Context,
+                                              StringRef Name,
+                                              ArrayRef<Type *> Types = {},
+                                              ArrayRef<unsigned> Ints = {});
+
+  /// Check that a newly created target extension type has the expected number
+  /// of type parameters and integer parameters, returning the type itself if OK
+  /// or an appropriate Error if not.
+  static Expected<TargetExtType *> checkParams(TargetExtType *TTy);
 
   /// Return the name for this target extension type. Two distinct target
   /// extension types may have the same name if their type or integer parameters

@@ -20,6 +20,18 @@ void MetadataManager::registerRewriter(
   Rewriters.emplace_back(std::move(Rewriter));
 }
 
+void MetadataManager::runSectionInitializers() {
+  for (auto &Rewriter : Rewriters) {
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: invoking " << Rewriter->getName()
+                      << " after reading sections\n");
+    if (Error E = Rewriter->sectionInitializer()) {
+      errs() << "BOLT-ERROR: while running " << Rewriter->getName()
+             << " after reading sections: " << toString(std::move(E)) << '\n';
+      exit(1);
+    }
+  }
+}
+
 void MetadataManager::runInitializersPreCFG() {
   for (auto &Rewriter : Rewriters) {
     LLVM_DEBUG(dbgs() << "BOLT-DEBUG: invoking " << Rewriter->getName()
@@ -27,6 +39,30 @@ void MetadataManager::runInitializersPreCFG() {
     if (Error E = Rewriter->preCFGInitializer()) {
       errs() << "BOLT-ERROR: while running " << Rewriter->getName()
              << " in pre-CFG state: " << toString(std::move(E)) << '\n';
+      exit(1);
+    }
+  }
+}
+
+void MetadataManager::runInitializersPostCFG() {
+  for (auto &Rewriter : Rewriters) {
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: invoking " << Rewriter->getName()
+                      << " after CFG construction\n");
+    if (Error E = Rewriter->postCFGInitializer()) {
+      errs() << "BOLT-ERROR: while running " << Rewriter->getName()
+             << " in CFG state: " << toString(std::move(E)) << '\n';
+      exit(1);
+    }
+  }
+}
+
+void MetadataManager::runFinalizersPreEmit() {
+  for (auto &Rewriter : Rewriters) {
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: invoking " << Rewriter->getName()
+                      << " before emitting binary context\n");
+    if (Error E = Rewriter->preEmitFinalizer()) {
+      errs() << "BOLT-ERROR: while running " << Rewriter->getName()
+             << " before emit: " << toString(std::move(E)) << '\n';
       exit(1);
     }
   }

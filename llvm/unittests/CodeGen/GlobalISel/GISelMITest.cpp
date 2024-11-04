@@ -14,7 +14,7 @@ operator<<(std::ostream &OS, const LLT Ty) {
   std::string Repr;
   raw_string_ostream SS{Repr};
   Ty.print(SS);
-  OS << SS.str();
+  OS << Repr;
   return OS;
 }
 
@@ -23,7 +23,7 @@ operator<<(std::ostream &OS, const MachineFunction &MF) {
   std::string Repr;
   raw_string_ostream SS{Repr};
   MF.print(SS);
-  OS << SS.str();
+  OS << Repr;
   return OS;
 }
 
@@ -40,7 +40,7 @@ AArch64GISelMITest::createTargetMachine() const {
   TargetOptions Options;
   return std::unique_ptr<LLVMTargetMachine>(static_cast<LLVMTargetMachine *>(
       T->createTargetMachine("AArch64", "", "", Options, std::nullopt,
-                             std::nullopt, CodeGenOpt::Aggressive)));
+                             std::nullopt, CodeGenOptLevel::Aggressive)));
 }
 
 void AArch64GISelMITest::getTargetTestModuleString(SmallString<512> &S,
@@ -79,7 +79,7 @@ AMDGPUGISelMITest::createTargetMachine() const {
   return std::unique_ptr<LLVMTargetMachine>(static_cast<LLVMTargetMachine *>(
       T->createTargetMachine("amdgcn-amd-amdhsa", "gfx900", "", Options,
                              std::nullopt, std::nullopt,
-                             CodeGenOpt::Aggressive)));
+                             CodeGenOptLevel::Aggressive)));
 }
 
 void AMDGPUGISelMITest::getTargetTestModuleString(

@@ -34,10 +34,18 @@ const char *getEdgeKindName(Edge::Kind K) {
     return "Delta64";
   case Delta32:
     return "Delta32";
+  case Delta16:
+    return "Delta16";
+  case Delta8:
+    return "Delta8";
   case NegDelta64:
     return "NegDelta64";
   case NegDelta32:
     return "NegDelta32";
+  case Size64:
+    return "Size64";
+  case Size32:
+    return "Size32";
   case Delta64FromGOT:
     return "Delta64FromGOT";
   case PCRel32:
@@ -104,8 +112,8 @@ Error optimizeGOTAndStubAccesses(LinkGraph &G) {
         orc::ExecutorAddr TargetAddr = GOTTarget.getAddress();
         orc::ExecutorAddr EdgeAddr = B->getFixupAddress(E);
         int64_t Displacement = TargetAddr - EdgeAddr + 4;
-        bool TargetInRangeForImmU32 = isInRangeForImmU32(TargetAddr.getValue());
-        bool DisplacementInRangeForImmS32 = isInRangeForImmS32(Displacement);
+        bool TargetInRangeForImmU32 = isUInt<32>(TargetAddr.getValue());
+        bool DisplacementInRangeForImmS32 = isInt<32>(Displacement);
 
         // If both of the Target and displacement is out of range, then
         // there isn't optimization chance.
@@ -175,7 +183,7 @@ Error optimizeGOTAndStubAccesses(LinkGraph &G) {
         orc::ExecutorAddr TargetAddr = GOTTarget.getAddress();
 
         int64_t Displacement = TargetAddr - EdgeAddr + 4;
-        if (isInRangeForImmS32(Displacement)) {
+        if (isInt<32>(Displacement)) {
           E.setKind(x86_64::BranchPCRel32);
           E.setTarget(GOTTarget);
           LLVM_DEBUG({

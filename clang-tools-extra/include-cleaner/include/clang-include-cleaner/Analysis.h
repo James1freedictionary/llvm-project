@@ -15,11 +15,13 @@
 #include "clang-include-cleaner/Types.h"
 #include "clang/Format/Format.h"
 #include "clang/Lex/HeaderSearch.h"
+#include "clang/Lex/Preprocessor.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include <string>
+#include <utility>
 
 namespace clang {
 class SourceLocation;
@@ -56,11 +58,13 @@ using UsedSymbolCB = llvm::function_ref<void(const SymbolReference &SymRef,
 ///    the headers for any referenced symbol
 void walkUsed(llvm::ArrayRef<Decl *> ASTRoots,
               llvm::ArrayRef<SymbolReference> MacroRefs,
-              const PragmaIncludes *PI, const SourceManager &, UsedSymbolCB CB);
+              const PragmaIncludes *PI, const Preprocessor &PP,
+              UsedSymbolCB CB);
 
 struct AnalysisResults {
   std::vector<const Include *> Unused;
-  std::vector<std::string> Missing; // Spellings, like "<vector>"
+  // Spellings, like "<vector>" paired with the Header that generated it.
+  std::vector<std::pair<std::string, Header>> Missing;
 };
 
 /// Determine which headers should be inserted or removed from the main file.
@@ -72,14 +76,14 @@ struct AnalysisResults {
 AnalysisResults
 analyze(llvm::ArrayRef<Decl *> ASTRoots,
         llvm::ArrayRef<SymbolReference> MacroRefs, const Includes &I,
-        const PragmaIncludes *PI, const SourceManager &SM,
-        const HeaderSearch &HS,
+        const PragmaIncludes *PI, const Preprocessor &PP,
         llvm::function_ref<bool(llvm::StringRef)> HeaderFilter = nullptr);
 
 /// Removes unused includes and inserts missing ones in the main file.
 /// Returns the modified main-file code.
 /// The FormatStyle must be C++ or ObjC (to support include ordering).
-std::string fixIncludes(const AnalysisResults &Results, llvm::StringRef Code,
+std::string fixIncludes(const AnalysisResults &Results,
+                        llvm::StringRef FileName, llvm::StringRef Code,
                         const format::FormatStyle &IncludeStyle);
 
 /// Gets all the providers for a symbol by traversing each location.

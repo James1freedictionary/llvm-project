@@ -278,24 +278,23 @@ define dso_local void @example25() nounwind {
 ; SSE2-LABEL: example25:
 ; SSE2:       # %bb.0: # %vector.ph
 ; SSE2-NEXT:    movq $-4096, %rax # imm = 0xF000
-; SSE2-NEXT:    movaps {{.*#+}} xmm0 = [1,1,1,1]
-; SSE2-NEXT:    .p2align 4, 0x90
+; SSE2-NEXT:    .p2align 4
 ; SSE2-NEXT:  .LBB5_1: # %vector.body
 ; SSE2-NEXT:    # =>This Inner Loop Header: Depth=1
-; SSE2-NEXT:    movaps da+4112(%rax), %xmm1
-; SSE2-NEXT:    movaps da+4096(%rax), %xmm2
-; SSE2-NEXT:    cmpltps db+4096(%rax), %xmm2
-; SSE2-NEXT:    cmpltps db+4112(%rax), %xmm1
-; SSE2-NEXT:    movaps dc+4112(%rax), %xmm3
-; SSE2-NEXT:    movaps dc+4096(%rax), %xmm4
-; SSE2-NEXT:    cmpltps dd+4096(%rax), %xmm4
-; SSE2-NEXT:    andps %xmm2, %xmm4
-; SSE2-NEXT:    cmpltps dd+4112(%rax), %xmm3
+; SSE2-NEXT:    movaps da+4112(%rax), %xmm0
+; SSE2-NEXT:    movaps da+4096(%rax), %xmm1
+; SSE2-NEXT:    cmpltps db+4096(%rax), %xmm1
+; SSE2-NEXT:    cmpltps db+4112(%rax), %xmm0
+; SSE2-NEXT:    movaps dc+4112(%rax), %xmm2
+; SSE2-NEXT:    movaps dc+4096(%rax), %xmm3
+; SSE2-NEXT:    cmpltps dd+4096(%rax), %xmm3
 ; SSE2-NEXT:    andps %xmm1, %xmm3
-; SSE2-NEXT:    andps %xmm0, %xmm4
-; SSE2-NEXT:    andps %xmm0, %xmm3
-; SSE2-NEXT:    movaps %xmm3, dj+4112(%rax)
-; SSE2-NEXT:    movaps %xmm4, dj+4096(%rax)
+; SSE2-NEXT:    cmpltps dd+4112(%rax), %xmm2
+; SSE2-NEXT:    andps %xmm0, %xmm2
+; SSE2-NEXT:    psrld $31, %xmm3
+; SSE2-NEXT:    psrld $31, %xmm2
+; SSE2-NEXT:    movdqa %xmm2, dj+4112(%rax)
+; SSE2-NEXT:    movdqa %xmm3, dj+4096(%rax)
 ; SSE2-NEXT:    addq $32, %rax
 ; SSE2-NEXT:    jne .LBB5_1
 ; SSE2-NEXT:  # %bb.2: # %for.end
@@ -304,24 +303,23 @@ define dso_local void @example25() nounwind {
 ; SSE41-LABEL: example25:
 ; SSE41:       # %bb.0: # %vector.ph
 ; SSE41-NEXT:    movq $-4096, %rax # imm = 0xF000
-; SSE41-NEXT:    movaps {{.*#+}} xmm0 = [1,1,1,1]
-; SSE41-NEXT:    .p2align 4, 0x90
+; SSE41-NEXT:    .p2align 4
 ; SSE41-NEXT:  .LBB5_1: # %vector.body
 ; SSE41-NEXT:    # =>This Inner Loop Header: Depth=1
-; SSE41-NEXT:    movaps da+4112(%rax), %xmm1
-; SSE41-NEXT:    movaps da+4096(%rax), %xmm2
-; SSE41-NEXT:    cmpltps db+4096(%rax), %xmm2
-; SSE41-NEXT:    cmpltps db+4112(%rax), %xmm1
-; SSE41-NEXT:    movaps dc+4112(%rax), %xmm3
-; SSE41-NEXT:    movaps dc+4096(%rax), %xmm4
-; SSE41-NEXT:    cmpltps dd+4096(%rax), %xmm4
-; SSE41-NEXT:    andps %xmm2, %xmm4
-; SSE41-NEXT:    cmpltps dd+4112(%rax), %xmm3
+; SSE41-NEXT:    movaps da+4112(%rax), %xmm0
+; SSE41-NEXT:    movaps da+4096(%rax), %xmm1
+; SSE41-NEXT:    cmpltps db+4096(%rax), %xmm1
+; SSE41-NEXT:    cmpltps db+4112(%rax), %xmm0
+; SSE41-NEXT:    movaps dc+4112(%rax), %xmm2
+; SSE41-NEXT:    movaps dc+4096(%rax), %xmm3
+; SSE41-NEXT:    cmpltps dd+4096(%rax), %xmm3
 ; SSE41-NEXT:    andps %xmm1, %xmm3
-; SSE41-NEXT:    andps %xmm0, %xmm4
-; SSE41-NEXT:    andps %xmm0, %xmm3
-; SSE41-NEXT:    movaps %xmm3, dj+4112(%rax)
-; SSE41-NEXT:    movaps %xmm4, dj+4096(%rax)
+; SSE41-NEXT:    cmpltps dd+4112(%rax), %xmm2
+; SSE41-NEXT:    andps %xmm0, %xmm2
+; SSE41-NEXT:    psrld $31, %xmm3
+; SSE41-NEXT:    psrld $31, %xmm2
+; SSE41-NEXT:    movdqa %xmm2, dj+4112(%rax)
+; SSE41-NEXT:    movdqa %xmm3, dj+4096(%rax)
 ; SSE41-NEXT:    addq $32, %rax
 ; SSE41-NEXT:    jne .LBB5_1
 ; SSE41-NEXT:  # %bb.2: # %for.end
@@ -331,7 +329,7 @@ define dso_local void @example25() nounwind {
 ; AVX1:       # %bb.0: # %vector.ph
 ; AVX1-NEXT:    movq $-4096, %rax # imm = 0xF000
 ; AVX1-NEXT:    vbroadcastss {{.*#+}} ymm0 = [1,1,1,1,1,1,1,1]
-; AVX1-NEXT:    .p2align 4, 0x90
+; AVX1-NEXT:    .p2align 4
 ; AVX1-NEXT:  .LBB5_1: # %vector.body
 ; AVX1-NEXT:    # =>This Inner Loop Header: Depth=1
 ; AVX1-NEXT:    vmovups da+4096(%rax), %ymm1
@@ -350,7 +348,7 @@ define dso_local void @example25() nounwind {
 ; AVX2-LABEL: example25:
 ; AVX2:       # %bb.0: # %vector.ph
 ; AVX2-NEXT:    movq $-4096, %rax # imm = 0xF000
-; AVX2-NEXT:    .p2align 4, 0x90
+; AVX2-NEXT:    .p2align 4
 ; AVX2-NEXT:  .LBB5_1: # %vector.body
 ; AVX2-NEXT:    # =>This Inner Loop Header: Depth=1
 ; AVX2-NEXT:    vmovups da+4096(%rax), %ymm0
@@ -404,7 +402,7 @@ define dso_local void @example24(i16 signext %x, i16 signext %y) nounwind {
 ; SSE2-NEXT:    pshuflw {{.*#+}} xmm1 = xmm1[0,0,0,0,4,5,6,7]
 ; SSE2-NEXT:    pshufd {{.*#+}} xmm1 = xmm1[0,0,0,0]
 ; SSE2-NEXT:    movq $-4096, %rax # imm = 0xF000
-; SSE2-NEXT:    .p2align 4, 0x90
+; SSE2-NEXT:    .p2align 4
 ; SSE2-NEXT:  .LBB6_1: # %vector.body
 ; SSE2-NEXT:    # =>This Inner Loop Header: Depth=1
 ; SSE2-NEXT:    movaps da+4096(%rax), %xmm2
@@ -436,7 +434,7 @@ define dso_local void @example24(i16 signext %x, i16 signext %y) nounwind {
 ; SSE41-NEXT:    pshuflw {{.*#+}} xmm0 = xmm0[0,0,0,0,4,5,6,7]
 ; SSE41-NEXT:    pshufd {{.*#+}} xmm2 = xmm0[0,0,0,0]
 ; SSE41-NEXT:    movq $-4096, %rax # imm = 0xF000
-; SSE41-NEXT:    .p2align 4, 0x90
+; SSE41-NEXT:    .p2align 4
 ; SSE41-NEXT:  .LBB6_1: # %vector.body
 ; SSE41-NEXT:    # =>This Inner Loop Header: Depth=1
 ; SSE41-NEXT:    movaps da+4096(%rax), %xmm0
@@ -471,7 +469,7 @@ define dso_local void @example24(i16 signext %x, i16 signext %y) nounwind {
 ; AVX1-NEXT:    vpmovsxwd %xmm2, %xmm2
 ; AVX1-NEXT:    vpshufd {{.*#+}} xmm3 = xmm3[2,3,2,3]
 ; AVX1-NEXT:    vpmovsxwd %xmm3, %xmm3
-; AVX1-NEXT:    .p2align 4, 0x90
+; AVX1-NEXT:    .p2align 4
 ; AVX1-NEXT:  .LBB6_1: # %vector.body
 ; AVX1-NEXT:    # =>This Inner Loop Header: Depth=1
 ; AVX1-NEXT:    vmovups da+4096(%rax), %ymm4
@@ -496,7 +494,7 @@ define dso_local void @example24(i16 signext %x, i16 signext %y) nounwind {
 ; AVX2-NEXT:    movq $-4096, %rax # imm = 0xF000
 ; AVX2-NEXT:    vpmovsxwd %xmm0, %ymm0
 ; AVX2-NEXT:    vpmovsxwd %xmm1, %ymm1
-; AVX2-NEXT:    .p2align 4, 0x90
+; AVX2-NEXT:    .p2align 4
 ; AVX2-NEXT:  .LBB6_1: # %vector.body
 ; AVX2-NEXT:    # =>This Inner Loop Header: Depth=1
 ; AVX2-NEXT:    vmovups da+4096(%rax), %ymm2

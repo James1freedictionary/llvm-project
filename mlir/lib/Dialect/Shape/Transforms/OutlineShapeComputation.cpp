@@ -49,7 +49,7 @@ getInputsOfCluster(const llvm::SmallVector<Operation *, 8> &cluster) {
   for (Operation *op : cluster) {
     for (Value operand : op->getOperands()) {
       Operation *operandOp = operand.getDefiningOp();
-      if (opSet.find(operandOp) != opSet.end()) {
+      if (opSet.contains(operandOp)) {
         // Skip if defining op is in the cluster.
         continue;
       }
@@ -292,10 +292,8 @@ void OutlineShapeComputationPass::getClusterFromValue(
       cluster.insert(op);
       for (Value inp : op->getOperands()) {
         Operation *inpDefOp = inp.getDefiningOp();
-        if (nullptr != inpDefOp && !visited.contains(inpDefOp)) {
-          visited.insert(inpDefOp);
+        if (nullptr != inpDefOp && visited.insert(inpDefOp).second)
           queue.push(inpDefOp);
-        }
       }
     }
   }

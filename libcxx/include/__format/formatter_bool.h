@@ -11,7 +11,7 @@
 #define _LIBCPP___FORMAT_FORMATTER_BOOL_H
 
 #include <__algorithm/copy.h>
-#include <__availability>
+#include <__assert>
 #include <__config>
 #include <__format/concepts.h>
 #include <__format/format_parse_context.h>
@@ -21,7 +21,7 @@
 #include <__utility/unreachable.h>
 
 #ifndef _LIBCPP_HAS_NO_LOCALIZATION
-#  include <locale>
+#  include <__locale>
 #endif
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
@@ -38,7 +38,7 @@ public:
   template <class _ParseContext>
   _LIBCPP_HIDE_FROM_ABI constexpr typename _ParseContext::iterator parse(_ParseContext& __ctx) {
     typename _ParseContext::iterator __result = __parser_.__parse(__ctx, __format_spec::__fields_integral);
-    __format_spec::__process_parsed_bool(__parser_);
+    __format_spec::__process_parsed_bool(__parser_, "a bool");
     return __result;
   }
 
@@ -61,7 +61,7 @@ public:
           static_cast<unsigned>(__value), __ctx, __parser_.__get_parsed_std_specifications(__ctx));
 
     default:
-      _LIBCPP_ASSERT_UNCATEGORIZED(false, "The parse function should have validated the type");
+      _LIBCPP_ASSERT_INTERNAL(false, "The parse function should have validated the type");
       __libcpp_unreachable();
     }
   }
@@ -69,7 +69,11 @@ public:
   __format_spec::__parser<_CharT> __parser_;
 };
 
-#endif //_LIBCPP_STD_VER >= 20
+#  if _LIBCPP_STD_VER >= 23
+template <>
+inline constexpr bool enable_nonlocking_formatter_optimization<bool> = true;
+#  endif // _LIBCPP_STD_VER >= 23
+#endif   // _LIBCPP_STD_VER >= 20
 
 _LIBCPP_END_NAMESPACE_STD
 

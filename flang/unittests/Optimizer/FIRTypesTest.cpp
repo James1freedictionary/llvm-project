@@ -229,10 +229,10 @@ TEST_F(FIRTypesTest, updateTypeForUnlimitedPolymorphic) {
   mlir::Type i32Ty = mlir::IntegerType::get(&context, 32);
   mlir::Type f32Ty = mlir::FloatType::getF32(&context);
   mlir::Type l1Ty = fir::LogicalType::get(&context, 1);
-  mlir::Type cplx4Ty = fir::ComplexType::get(&context, 4);
+  mlir::Type cplx32Ty = mlir::ComplexType::get(f32Ty);
   mlir::Type char1Ty = fir::CharacterType::get(&context, 1, 10);
   llvm::SmallVector<mlir::Type> intrinsicTypes = {
-      i32Ty, f32Ty, l1Ty, cplx4Ty, char1Ty};
+      i32Ty, f32Ty, l1Ty, cplx32Ty, char1Ty};
 
   for (mlir::Type ty : intrinsicTypes) {
     // `ty` -> none
@@ -304,4 +304,15 @@ TEST_F(FIRTypesTest, getTypeAsString) {
   components.emplace_back("p1", mlir::IntegerType::get(&context, 64));
   derivedTy.finalize({}, components);
   EXPECT_EQ("rec_derived", fir::getTypeAsString(derivedTy, *kindMap));
+  mlir::Type dynArrTy =
+      fir::SequenceType::get({fir::SequenceType::getUnknownExtent(),
+                                 fir::SequenceType::getUnknownExtent()},
+          ty);
+  EXPECT_EQ("UxUxi64", fir::getTypeAsString(dynArrTy, *kindMap));
+  EXPECT_EQ("llvmptr_i32",
+      fir::getTypeAsString(
+          fir::LLVMPointerType::get(mlir::IntegerType::get(&context, 32)),
+          *kindMap));
+  EXPECT_EQ("boxchar_c8xU",
+      fir::getTypeAsString(fir::BoxCharType::get(&context, 1), *kindMap));
 }

@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+using namespace Fortran::common;
 using namespace Fortran::frontend;
 using namespace Fortran::parser;
 using namespace Fortran;
@@ -85,8 +86,6 @@ public:
   READ_FEATURE(AccObjectList)
   READ_FEATURE(AccObjectListWithModifier)
   READ_FEATURE(AccObjectListWithReduction)
-  READ_FEATURE(AccReductionOperator)
-  READ_FEATURE(AccReductionOperator::Operator)
   READ_FEATURE(AccSizeExpr)
   READ_FEATURE(AccSizeExprList)
   READ_FEATURE(AccSelfClause)
@@ -280,7 +279,7 @@ public:
   READ_FEATURE(ErrorRecovery)
   READ_FEATURE(EventPostStmt)
   READ_FEATURE(EventWaitStmt)
-  READ_FEATURE(EventWaitStmt::EventWaitSpec)
+  READ_FEATURE(EventWaitSpec)
   READ_FEATURE(ExecutableConstruct)
   READ_FEATURE(ExecutionPart)
   READ_FEATURE(ExecutionPartConstruct)
@@ -409,10 +408,13 @@ public:
   READ_FEATURE(LetterSpec)
   READ_FEATURE(LiteralConstant)
   READ_FEATURE(IntLiteralConstant)
+  READ_FEATURE(ReductionOperator)
+  READ_FEATURE(ReductionOperator::Operator)
   READ_FEATURE(LocalitySpec)
   READ_FEATURE(LocalitySpec::DefaultNone)
   READ_FEATURE(LocalitySpec::Local)
   READ_FEATURE(LocalitySpec::LocalInit)
+  READ_FEATURE(LocalitySpec::Reduce)
   READ_FEATURE(LocalitySpec::Shared)
   READ_FEATURE(LockStmt)
   READ_FEATURE(LockStmt::LockStat)
@@ -437,6 +439,7 @@ public:
   READ_FEATURE(NamelistStmt::Group)
   READ_FEATURE(NonLabelDoStmt)
   READ_FEATURE(NoPass)
+  READ_FEATURE(NotifyWaitStmt)
   READ_FEATURE(NullifyStmt)
   READ_FEATURE(NullInit)
   READ_FEATURE(ObjectDecl)
@@ -470,8 +473,8 @@ public:
   READ_FEATURE(OmpDependClause::InOut)
   READ_FEATURE(OmpDependClause::Sink)
   READ_FEATURE(OmpDependClause::Source)
-  READ_FEATURE(OmpDependenceType)
-  READ_FEATURE(OmpDependenceType::Type)
+  READ_FEATURE(OmpTaskDependenceType)
+  READ_FEATURE(OmpTaskDependenceType::Type)
   READ_FEATURE(OmpDependSinkVec)
   READ_FEATURE(OmpDependSinkVecLength)
   READ_FEATURE(OmpEndAllocators)
@@ -480,6 +483,8 @@ public:
   READ_FEATURE(OmpEndCriticalDirective)
   READ_FEATURE(OmpEndLoopDirective)
   READ_FEATURE(OmpEndSectionsDirective)
+  READ_FEATURE(OmpGrainsizeClause)
+  READ_FEATURE(OmpGrainsizeClause::Prescriptiveness)
   READ_FEATURE(OmpIfClause)
   READ_FEATURE(OmpIfClause::DirectiveNameModifier)
   READ_FEATURE(OmpLinearClause)
@@ -489,9 +494,10 @@ public:
   READ_FEATURE(OmpLinearModifier::Type)
   READ_FEATURE(OmpLoopDirective)
   READ_FEATURE(OmpMapClause)
-  READ_FEATURE(OmpMapType)
-  READ_FEATURE(OmpMapType::Always)
-  READ_FEATURE(OmpMapType::Type)
+  READ_FEATURE(OmpMapClause::TypeModifier)
+  READ_FEATURE(OmpMapClause::Type)
+  READ_FEATURE(OmpNumTasksClause)
+  READ_FEATURE(OmpNumTasksClause::Prescriptiveness)
   READ_FEATURE(OmpObject)
   READ_FEATURE(OmpObjectList)
   READ_FEATURE(OmpOrderClause)
@@ -553,7 +559,7 @@ public:
   READ_FEATURE(OmpAtomicClause)
   READ_FEATURE(OmpAtomicClauseList)
   READ_FEATURE(OmpAtomicDefaultMemOrderClause)
-  READ_FEATURE(OmpAtomicDefaultMemOrderClause::Type)
+  READ_FEATURE(OmpAtomicDefaultMemOrderType)
   READ_FEATURE(OpenMPFlushConstruct)
   READ_FEATURE(OpenMPLoopConstruct)
   READ_FEATURE(OpenMPExecutableAllocate)
@@ -773,7 +779,9 @@ class FeatureListAction : public PluginParseTreeAction {
     }
   }
 
-  bool beginSourceFileAction() override { return runPrescan() && runParse(); }
+  bool beginSourceFileAction() override {
+    return runPrescan() && runParse(/*emitMessages=*/true);
+  }
 };
 
 static FrontendPluginRegistry::Add<FeatureListAction> X(

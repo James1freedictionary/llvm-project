@@ -9,34 +9,44 @@
 #include "check-omp-structure.h"
 #include "definable.h"
 #include "flang/Parser/parse-tree.h"
+#include "flang/Semantics/expression.h"
 #include "flang/Semantics/tools.h"
-#include <algorithm>
 
 namespace Fortran::semantics {
 
 // Use when clause falls under 'struct OmpClause' in 'parse-tree.h'.
 #define CHECK_SIMPLE_CLAUSE(X, Y) \
   void OmpStructureChecker::Enter(const parser::OmpClause::X &) { \
-    CheckAllowed(llvm::omp::Clause::Y); \
+    CheckAllowedClause(llvm::omp::Clause::Y); \
   }
 
 #define CHECK_REQ_CONSTANT_SCALAR_INT_CLAUSE(X, Y) \
   void OmpStructureChecker::Enter(const parser::OmpClause::X &c) { \
-    CheckAllowed(llvm::omp::Clause::Y); \
+    CheckAllowedClause(llvm::omp::Clause::Y); \
     RequiresConstantPositiveParameter(llvm::omp::Clause::Y, c.v); \
   }
 
 #define CHECK_REQ_SCALAR_INT_CLAUSE(X, Y) \
   void OmpStructureChecker::Enter(const parser::OmpClause::X &c) { \
-    CheckAllowed(llvm::omp::Clause::Y); \
+    CheckAllowedClause(llvm::omp::Clause::Y); \
     RequiresPositiveParameter(llvm::omp::Clause::Y, c.v); \
   }
 
 // Use when clause don't falls under 'struct OmpClause' in 'parse-tree.h'.
 #define CHECK_SIMPLE_PARSER_CLAUSE(X, Y) \
   void OmpStructureChecker::Enter(const parser::X &) { \
-    CheckAllowed(llvm::omp::Y); \
+    CheckAllowedClause(llvm::omp::Y); \
   }
+
+std::string ThisVersion(unsigned version) {
+  std::string tv{
+      std::to_string(version / 10) + "." + std::to_string(version % 10)};
+  return "OpenMP v" + tv;
+}
+
+std::string TryVersion(unsigned version) {
+  return "try -fopenmp-version=" + std::to_string(version);
+}
 
 // 'OmpWorkshareBlockChecker' is used to check the validity of the assignment
 // statements and the expressions enclosed in an OpenMP Workshare construct
@@ -69,11 +79,23 @@ public:
     if (const auto *e{GetExpr(context_, expr)}) {
       for (const Symbol &symbol : evaluate::CollectSymbols(*e)) {
         const Symbol &root{GetAssociationRoot(symbol)};
-        if (IsFunction(root) && !IsElementalProcedure(root)) {
-          context_.Say(expr.source,
-              "User defined non-ELEMENTAL function "
-              "'%s' is not allowed in a WORKSHARE construct"_err_en_US,
-              root.name());
+        if (IsFunction(root)) {
+          std::string attrs{""};
+          if (!IsElementalProcedure(root)) {
+            attrs = " non-ELEMENTAL";
+          }
+          if (root.attrs().test(Attr::IMPURE)) {
+            if (attrs != "") {
+              attrs = "," + attrs;
+            }
+            attrs = " IMPURE" + attrs;
+          }
+          if (attrs != "") {
+            context_.Say(expr.source,
+                "User defined%s function '%s' is not allowed in a "
+                "WORKSHARE construct"_err_en_US,
+                attrs, root.name());
+          }
         }
       }
     }
@@ -85,49 +107,125 @@ private:
   parser::CharBlock source_;
 };
 
-class OmpCycleChecker {
+class AssociatedLoopChecker {
 public:
-  OmpCycleChecker(SemanticsContext &context, std::int64_t cycleLevel)
-      : context_{context}, cycleLevel_{cycleLevel} {}
+  AssociatedLoopChecker(SemanticsContext &context, std::int64_t level)
+      : context_{context}, level_{level} {}
 
   template <typename T> bool Pre(const T &) { return true; }
   template <typename T> void Post(const T &) {}
 
   bool Pre(const parser::DoConstruct &dc) {
-    cycleLevel_--;
-    const auto &labelName{std::get<0>(std::get<0>(dc.t).statement.t)};
-    if (labelName) {
-      labelNamesandLevels_.emplace(labelName.value().ToString(), cycleLevel_);
+    level_--;
+    const auto &doStmt{
+        std::get<parser::Statement<parser::NonLabelDoStmt>>(dc.t)};
+    const auto &constructName{
+        std::get<std::optional<parser::Name>>(doStmt.statement.t)};
+    if (constructName) {
+      constructNamesAndLevels_.emplace(
+          constructName.value().ToString(), level_);
+    }
+    if (level_ >= 0) {
+      if (dc.IsDoWhile()) {
+        context_.Say(doStmt.source,
+            "The associated loop of a loop-associated directive cannot be a DO WHILE."_err_en_US);
+      }
+      if (!dc.GetLoopControl()) {
+        context_.Say(doStmt.source,
+            "The associated loop of a loop-associated directive cannot be a DO without control."_err_en_US);
+      }
     }
     return true;
   }
+
+  void Post(const parser::DoConstruct &dc) { level_++; }
 
   bool Pre(const parser::CycleStmt &cyclestmt) {
     std::map<std::string, std::int64_t>::iterator it;
     bool err{false};
     if (cyclestmt.v) {
-      it = labelNamesandLevels_.find(cyclestmt.v->source.ToString());
-      err = (it != labelNamesandLevels_.end() && it->second > 0);
+      it = constructNamesAndLevels_.find(cyclestmt.v->source.ToString());
+      err = (it != constructNamesAndLevels_.end() && it->second > 0);
+    } else { // If there is no label then use the level of the last enclosing DO
+      err = level_ > 0;
     }
-    if (cycleLevel_ > 0 || err) {
-      context_.Say(*cycleSource_,
+    if (err) {
+      context_.Say(*source_,
           "CYCLE statement to non-innermost associated loop of an OpenMP DO "
           "construct"_err_en_US);
     }
     return true;
   }
 
+  bool Pre(const parser::ExitStmt &exitStmt) {
+    std::map<std::string, std::int64_t>::iterator it;
+    bool err{false};
+    if (exitStmt.v) {
+      it = constructNamesAndLevels_.find(exitStmt.v->source.ToString());
+      err = (it != constructNamesAndLevels_.end() && it->second >= 0);
+    } else { // If there is no label then use the level of the last enclosing DO
+      err = level_ >= 0;
+    }
+    if (err) {
+      context_.Say(*source_,
+          "EXIT statement terminates associated loop of an OpenMP DO "
+          "construct"_err_en_US);
+    }
+    return true;
+  }
+
   bool Pre(const parser::Statement<parser::ActionStmt> &actionstmt) {
-    cycleSource_ = &actionstmt.source;
+    source_ = &actionstmt.source;
     return true;
   }
 
 private:
   SemanticsContext &context_;
-  const parser::CharBlock *cycleSource_;
-  std::int64_t cycleLevel_;
-  std::map<std::string, std::int64_t> labelNamesandLevels_;
+  const parser::CharBlock *source_;
+  std::int64_t level_;
+  std::map<std::string, std::int64_t> constructNamesAndLevels_;
 };
+
+bool OmpStructureChecker::CheckAllowedClause(llvmOmpClause clause) {
+  unsigned version{context_.langOptions().OpenMPVersion};
+  DirectiveContext &dirCtx = GetContext();
+  llvm::omp::Directive dir{dirCtx.directive};
+
+  if (!llvm::omp::isAllowedClauseForDirective(dir, clause, version)) {
+    unsigned allowedInVersion{[&] {
+      for (unsigned v : {45, 50, 51, 52, 60}) {
+        if (v <= version) {
+          continue;
+        }
+        if (llvm::omp::isAllowedClauseForDirective(dir, clause, v)) {
+          return v;
+        }
+      }
+      return 0u;
+    }()};
+
+    // Only report it if there is a later version that allows it.
+    // If it's not allowed at all, it will be reported by CheckAllowed.
+    if (allowedInVersion != 0) {
+      auto clauseName{parser::ToUpperCaseLetters(getClauseName(clause).str())};
+      auto dirName{parser::ToUpperCaseLetters(getDirectiveName(dir).str())};
+
+      context_.Say(dirCtx.clauseSource,
+          "%s clause is not allowed on directive %s in %s, %s"_err_en_US,
+          clauseName, dirName, ThisVersion(version),
+          TryVersion(allowedInVersion));
+    }
+  }
+  return CheckAllowed(clause);
+}
+
+bool OmpStructureChecker::IsVariableListItem(const Symbol &sym) {
+  return evaluate::IsVariable(sym) || sym.attrs().test(Attr::POINTER);
+}
+
+bool OmpStructureChecker::IsExtendedListItem(const Symbol &sym) {
+  return IsVariableListItem(sym) || sym.IsSubprogram();
+}
 
 bool OmpStructureChecker::IsCloselyNestedRegion(const OmpDirectiveSet &set) {
   // Definition of close nesting:
@@ -161,7 +259,7 @@ bool OmpStructureChecker::IsCloselyNestedRegion(const OmpDirectiveSet &set) {
     while (index != -1) {
       if (set.test(dirContext_[index].directive)) {
         return true;
-      } else if (llvm::omp::parallelSet.test(dirContext_[index].directive)) {
+      } else if (llvm::omp::allParallelSet.test(dirContext_[index].directive)) {
         return false;
       }
       index--;
@@ -170,20 +268,22 @@ bool OmpStructureChecker::IsCloselyNestedRegion(const OmpDirectiveSet &set) {
   return false;
 }
 
+void OmpStructureChecker::CheckMultipleOccurrence(
+    semantics::UnorderedSymbolSet &listVars,
+    const std::list<parser::Name> &nameList, const parser::CharBlock &item,
+    const std::string &clauseName) {
+  for (auto const &var : nameList) {
+    if (llvm::is_contained(listVars, *(var.symbol))) {
+      context_.Say(item,
+          "List item '%s' present at multiple %s clauses"_err_en_US,
+          var.ToString(), clauseName);
+    }
+    listVars.insert(*(var.symbol));
+  }
+}
+
 void OmpStructureChecker::CheckMultListItems() {
   semantics::UnorderedSymbolSet listVars;
-  auto checkMultipleOcurrence = [&](const std::list<parser::Name> &nameList,
-                                    const parser::CharBlock &item,
-                                    const std::string &clauseName) {
-    for (auto const &var : nameList) {
-      if (llvm::is_contained(listVars, *(var.symbol))) {
-        context_.Say(item,
-            "List item '%s' present at multiple %s clauses"_err_en_US,
-            var.ToString(), clauseName);
-      }
-      listVars.insert(*(var.symbol));
-    }
-  };
 
   // Aligned clause
   auto alignedClauses{FindClauses(llvm::omp::Clause::OMPC_aligned)};
@@ -201,8 +301,8 @@ void OmpStructureChecker::CheckMultListItems() {
                 "ALIGNED clause"_err_en_US,
                 name->ToString());
           } else if (!(IsBuiltinCPtr(*(name->symbol)) ||
-                         IsAllocatableOrPointer(
-                             (name->symbol->GetUltimate())))) {
+                         IsAllocatableOrObjectPointer(
+                             &name->symbol->GetUltimate()))) {
             context_.Say(itr->second->source,
                 "'%s' in ALIGNED clause must be of type C_PTR, POINTER or "
                 "ALLOCATABLE"_err_en_US,
@@ -216,7 +316,8 @@ void OmpStructureChecker::CheckMultListItems() {
         }
       }
     }
-    checkMultipleOcurrence(alignedNameList, itr->second->source, "ALIGNED");
+    CheckMultipleOccurrence(
+        listVars, alignedNameList, itr->second->source, "ALIGNED");
   }
 
   // Nontemporal clause
@@ -226,7 +327,8 @@ void OmpStructureChecker::CheckMultListItems() {
     const auto &nontempClause{
         std::get<parser::OmpClause::Nontemporal>(itr->second->u)};
     const auto &nontempNameList{nontempClause.v};
-    checkMultipleOcurrence(nontempNameList, itr->second->source, "NONTEMPORAL");
+    CheckMultipleOccurrence(
+        listVars, nontempNameList, itr->second->source, "NONTEMPORAL");
   }
 }
 
@@ -247,23 +349,16 @@ bool OmpStructureChecker::HasInvalidWorksharingNesting(
 void OmpStructureChecker::HasInvalidDistributeNesting(
     const parser::OpenMPLoopConstruct &x) {
   bool violation{false};
-
-  OmpDirectiveSet distributeSet{llvm::omp::Directive::OMPD_distribute,
-      llvm::omp::Directive::OMPD_distribute_parallel_do,
-      llvm::omp::Directive::OMPD_distribute_parallel_do_simd,
-      llvm::omp::Directive::OMPD_distribute_parallel_for,
-      llvm::omp::Directive::OMPD_distribute_parallel_for_simd,
-      llvm::omp::Directive::OMPD_distribute_simd};
-
   const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
   const auto &beginDir{std::get<parser::OmpLoopDirective>(beginLoopDir.t)};
-  if (distributeSet.test(beginDir.v)) {
+  if (llvm::omp::topDistributeSet.test(beginDir.v)) {
     // `distribute` region has to be nested
     if (!CurrentDirectiveIsNested()) {
       violation = true;
     } else {
       // `distribute` region has to be strictly nested inside `teams`
-      if (!llvm::omp::teamSet.test(GetContextParent().directive)) {
+      if (!OmpDirectiveSet{llvm::omp::OMPD_teams, llvm::omp::OMPD_target_teams}
+               .test(GetContextParent().directive)) {
         violation = true;
       }
     }
@@ -277,24 +372,7 @@ void OmpStructureChecker::HasInvalidDistributeNesting(
 
 void OmpStructureChecker::HasInvalidTeamsNesting(
     const llvm::omp::Directive &dir, const parser::CharBlock &source) {
-  OmpDirectiveSet allowedSet{llvm::omp::Directive::OMPD_parallel,
-      llvm::omp::Directive::OMPD_parallel_do,
-      llvm::omp::Directive::OMPD_parallel_do_simd,
-      llvm::omp::Directive::OMPD_parallel_for,
-      llvm::omp::Directive::OMPD_parallel_for_simd,
-      llvm::omp::Directive::OMPD_parallel_master,
-      llvm::omp::Directive::OMPD_parallel_master_taskloop,
-      llvm::omp::Directive::OMPD_parallel_master_taskloop_simd,
-      llvm::omp::Directive::OMPD_parallel_sections,
-      llvm::omp::Directive::OMPD_parallel_workshare,
-      llvm::omp::Directive::OMPD_distribute,
-      llvm::omp::Directive::OMPD_distribute_parallel_do,
-      llvm::omp::Directive::OMPD_distribute_parallel_do_simd,
-      llvm::omp::Directive::OMPD_distribute_parallel_for,
-      llvm::omp::Directive::OMPD_distribute_parallel_for_simd,
-      llvm::omp::Directive::OMPD_distribute_simd};
-
-  if (!allowedSet.test(dir)) {
+  if (!llvm::omp::nestedTeamsAllowedSet.test(dir)) {
     context_.Say(source,
         "Only `DISTRIBUTE` or `PARALLEL` regions are allowed to be strictly "
         "nested inside `TEAMS` region."_err_en_US);
@@ -311,11 +389,12 @@ void OmpStructureChecker::CheckPredefinedAllocatorRestriction(
         (IsSaved(*symbol) || commonBlock ||
             containingScope.kind() == Scope::Kind::Module)) {
       context_.Say(source,
-          "If list items within the ALLOCATE directive have the "
+          "If list items within the %s directive have the "
           "SAVE attribute, are a common block name, or are "
           "declared in the scope of a module, then only "
           "predefined memory allocator parameters can be used "
-          "in the allocator clause"_err_en_US);
+          "in the allocator clause"_err_en_US,
+          ContextDirectiveAsFortran());
     }
   }
 }
@@ -402,6 +481,14 @@ void OmpStructureChecker::Enter(const parser::OpenMPConstruct &x) {
   }
 }
 
+void OmpStructureChecker::Leave(const parser::OpenMPConstruct &) {
+  for (const auto &[sym, source] : deferredNonVariables_) {
+    context_.SayWithDecl(
+        *sym, source, "'%s' must be a variable"_err_en_US, sym->name());
+  }
+  deferredNonVariables_.clear();
+}
+
 void OmpStructureChecker::Enter(const parser::OpenMPLoopConstruct &x) {
   const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
   const auto &beginDir{std::get<parser::OmpLoopDirective>(beginLoopDir.t)};
@@ -416,8 +503,15 @@ void OmpStructureChecker::Enter(const parser::OpenMPLoopConstruct &x) {
   }
 
   PushContextAndClauseSets(beginDir.source, beginDir.v);
-  if (llvm::omp::simdSet.test(GetContext().directive)) {
+  if (llvm::omp::allSimdSet.test(GetContext().directive)) {
     EnterDirectiveNest(SIMDNest);
+  }
+
+  // Combined target loop constructs are target device constructs. Keep track of
+  // whether any such construct has been visited to later check that REQUIRES
+  // directives for target-related options don't appear after them.
+  if (llvm::omp::allTargetSet.test(beginDir.v)) {
+    deviceConstructFound_ = true;
   }
 
   if (beginDir.v == llvm::omp::Directive::OMPD_do) {
@@ -441,12 +535,11 @@ void OmpStructureChecker::Enter(const parser::OpenMPLoopConstruct &x) {
     const auto &doBlock{std::get<parser::Block>(doConstruct->t)};
     CheckNoBranching(doBlock, beginDir.v, beginDir.source);
   }
-  CheckDoWhile(x);
   CheckLoopItrVariableIsInt(x);
-  CheckCycleConstraints(x);
+  CheckAssociatedLoopConstraints(x);
   HasInvalidDistributeNesting(x);
   if (CurrentDirectiveIsNested() &&
-      llvm::omp::teamSet.test(GetContextParent().directive)) {
+      llvm::omp::topTeamsSet.test(GetContextParent().directive)) {
     HasInvalidTeamsNesting(beginDir.v, beginDir.source);
   }
   if ((beginDir.v == llvm::omp::Directive::OMPD_distribute_parallel_do_simd) ||
@@ -469,19 +562,64 @@ void OmpStructureChecker::SetLoopInfo(const parser::OpenMPLoopConstruct &x) {
     }
   }
 }
-void OmpStructureChecker::CheckDoWhile(const parser::OpenMPLoopConstruct &x) {
-  const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
-  const auto &beginDir{std::get<parser::OmpLoopDirective>(beginLoopDir.t)};
-  if (beginDir.v == llvm::omp::Directive::OMPD_do) {
-    if (const auto &doConstruct{
-            std::get<std::optional<parser::DoConstruct>>(x.t)}) {
-      if (doConstruct.value().IsDoWhile()) {
-        const auto &doStmt{std::get<parser::Statement<parser::NonLabelDoStmt>>(
-            doConstruct.value().t)};
-        context_.Say(doStmt.source,
-            "The DO loop cannot be a DO WHILE with DO directive."_err_en_US);
+
+void OmpStructureChecker::CheckIteratorRange(
+    const parser::OmpIteratorSpecifier &x) {
+  // Check:
+  // 1. Whether begin/end are present.
+  // 2. Whether the step value is non-zero.
+  // 3. If the step has a known sign, whether the lower/upper bounds form
+  // a proper interval.
+  const auto &[begin, end, step]{std::get<parser::SubscriptTriplet>(x.t).t};
+  if (!begin || !end) {
+    context_.Say(x.source,
+        "The begin and end expressions in iterator range-specification are "
+        "mandatory"_err_en_US);
+  }
+  // [5.2:67:19] In a range-specification, if the step is not specified its
+  // value is implicitly defined to be 1.
+  if (auto stepv{step ? GetIntValue(*step) : std::optional<int64_t>{1}}) {
+    if (*stepv == 0) {
+      context_.Say(
+          x.source, "The step value in the iterator range is 0"_warn_en_US);
+    } else if (begin && end) {
+      std::optional<int64_t> beginv{GetIntValue(*begin)};
+      std::optional<int64_t> endv{GetIntValue(*end)};
+      if (beginv && endv) {
+        if (*stepv > 0 && *beginv > *endv) {
+          context_.Say(x.source,
+              "The begin value is greater than the end value in iterator "
+              "range-specification with a positive step"_warn_en_US);
+        } else if (*stepv < 0 && *beginv < *endv) {
+          context_.Say(x.source,
+              "The begin value is less than the end value in iterator "
+              "range-specification with a negative step"_warn_en_US);
+        }
       }
     }
+  }
+}
+
+void OmpStructureChecker::CheckIteratorModifier(
+    const parser::OmpIteratorModifier &x) {
+  // Check if all iterator variables have integer type.
+  for (auto &&iterSpec : x.v) {
+    bool isInteger{true};
+    auto &typeDecl{std::get<parser::TypeDeclarationStmt>(iterSpec.t)};
+    auto &typeSpec{std::get<parser::DeclarationTypeSpec>(typeDecl.t)};
+    if (!std::holds_alternative<parser::IntrinsicTypeSpec>(typeSpec.u)) {
+      isInteger = false;
+    } else {
+      auto &intrinType{std::get<parser::IntrinsicTypeSpec>(typeSpec.u)};
+      if (!std::holds_alternative<parser::IntegerTypeSpec>(intrinType.u)) {
+        isInteger = false;
+      }
+    }
+    if (!isInteger) {
+      context_.Say(iterSpec.source,
+          "The iterator variable must be of integer type"_err_en_US);
+    }
+    CheckIteratorRange(iterSpec);
   }
 }
 
@@ -624,9 +762,9 @@ void OmpStructureChecker::CheckTargetNest(const parser::OpenMPConstruct &c) {
       },
       c.u);
   if (!eligibleTarget) {
-    context_.Say(parser::FindSourceLocation(c),
-        "If %s directive is nested inside TARGET region, the behaviour "
-        "is unspecified"_port_en_US,
+    context_.Warn(common::UsageWarning::Portability,
+        parser::FindSourceLocation(c),
+        "If %s directive is nested inside TARGET region, the behaviour is unspecified"_port_en_US,
         parser::ToUpperCaseLetters(
             getDirectiveName(ineligibleTargetDir).str()));
   }
@@ -637,8 +775,8 @@ std::int64_t OmpStructureChecker::GetOrdCollapseLevel(
   const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
   const auto &clauseList{std::get<parser::OmpClauseList>(beginLoopDir.t)};
   std::int64_t orderedCollapseLevel{1};
-  std::int64_t orderedLevel{0};
-  std::int64_t collapseLevel{0};
+  std::int64_t orderedLevel{1};
+  std::int64_t collapseLevel{1};
 
   for (const auto &clause : clauseList.v) {
     if (const auto *collapseClause{
@@ -662,11 +800,11 @@ std::int64_t OmpStructureChecker::GetOrdCollapseLevel(
   return orderedCollapseLevel;
 }
 
-void OmpStructureChecker::CheckCycleConstraints(
+void OmpStructureChecker::CheckAssociatedLoopConstraints(
     const parser::OpenMPLoopConstruct &x) {
   std::int64_t ordCollapseLevel{GetOrdCollapseLevel(x)};
-  OmpCycleChecker ompCycleChecker{context_, ordCollapseLevel};
-  parser::Walk(x, ompCycleChecker);
+  AssociatedLoopChecker checker{context_, ordCollapseLevel};
+  parser::Walk(x, checker);
 }
 
 void OmpStructureChecker::CheckDistLinear(
@@ -745,7 +883,7 @@ void OmpStructureChecker::CheckDistLinear(
 }
 
 void OmpStructureChecker::Leave(const parser::OpenMPLoopConstruct &) {
-  if (llvm::omp::simdSet.test(GetContext().directive)) {
+  if (llvm::omp::allSimdSet.test(GetContext().directive)) {
     ExitDirectiveNest(SIMDNest);
   }
   dirContext_.pop_back();
@@ -758,12 +896,22 @@ void OmpStructureChecker::Enter(const parser::OmpEndLoopDirective &x) {
   // 2.7.1 end-do -> END DO [nowait-clause]
   // 2.8.3 end-do-simd -> END DO SIMD [nowait-clause]
   case llvm::omp::Directive::OMPD_do:
+    PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_end_do);
+    break;
   case llvm::omp::Directive::OMPD_do_simd:
-    SetClauseSets(dir.v);
+    PushContextAndClauseSets(
+        dir.source, llvm::omp::Directive::OMPD_end_do_simd);
     break;
   default:
     // no clauses are allowed
     break;
+  }
+}
+
+void OmpStructureChecker::Leave(const parser::OmpEndLoopDirective &x) {
+  if ((GetContext().directive == llvm::omp::Directive::OMPD_end_do) ||
+      (GetContext().directive == llvm::omp::Directive::OMPD_end_do_simd)) {
+    dirContext_.pop_back();
   }
 }
 
@@ -782,7 +930,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPBlockConstruct &x) {
   }
 
   if (CurrentDirectiveIsNested()) {
-    if (llvm::omp::teamSet.test(GetContextParent().directive)) {
+    if (llvm::omp::topTeamsSet.test(GetContextParent().directive)) {
       HasInvalidTeamsNesting(beginDir.v, beginDir.source);
     }
     if (GetContext().directive == llvm::omp::Directive::OMPD_master) {
@@ -811,6 +959,13 @@ void OmpStructureChecker::Enter(const parser::OpenMPBlockConstruct &x) {
 
   CheckNoBranching(block, beginDir.v, beginDir.source);
 
+  // Target block constructs are target device constructs. Keep track of
+  // whether any such construct has been visited to later check that REQUIRES
+  // directives for target-related options don't appear after them.
+  if (llvm::omp::allTargetSet.test(beginDir.v)) {
+    deviceConstructFound_ = true;
+  }
+
   switch (beginDir.v) {
   case llvm::omp::Directive::OMPD_target:
     if (CheckTargetBlockOnlyTeams(block)) {
@@ -823,6 +978,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPBlockConstruct &x) {
     HasInvalidWorksharingNesting(
         beginDir.source, llvm::omp::nestedWorkshareErrSet);
     break;
+  case llvm::omp::Directive::OMPD_scope:
   case llvm::omp::Directive::OMPD_single:
     // TODO: This check needs to be extended while implementing nesting of
     // regions checks.
@@ -866,10 +1022,6 @@ void OmpStructureChecker::ChecksOnOrderedAsBlock() {
     return;
   }
 
-  OmpDirectiveSet notAllowedParallelSet{llvm::omp::Directive::OMPD_parallel,
-      llvm::omp::Directive::OMPD_target_parallel,
-      llvm::omp::Directive::OMPD_parallel_sections,
-      llvm::omp::Directive::OMPD_parallel_workshare};
   bool isNestedInDo{false};
   bool isNestedInDoSIMD{false};
   bool isNestedInSIMD{false};
@@ -883,9 +1035,10 @@ void OmpStructureChecker::ChecksOnOrderedAsBlock() {
             "`ORDERED` region may not be closely nested inside of `CRITICAL`, "
             "`ORDERED`, explicit `TASK` or `TASKLOOP` region."_err_en_US);
         break;
-      } else if (llvm::omp::doSet.test(dirContext_[i].directive)) {
+      } else if (llvm::omp::allDoSet.test(dirContext_[i].directive)) {
         isNestedInDo = true;
-        isNestedInDoSIMD = llvm::omp::doSimdSet.test(dirContext_[i].directive);
+        isNestedInDoSIMD =
+            llvm::omp::allDoSimdSet.test(dirContext_[i].directive);
         if (const auto *clause{
                 FindClause(dirContext_[i], llvm::omp::Clause::OMPC_ordered)}) {
           const auto &orderedClause{
@@ -896,10 +1049,11 @@ void OmpStructureChecker::ChecksOnOrderedAsBlock() {
           noOrderedClause = true;
         }
         break;
-      } else if (llvm::omp::simdSet.test(dirContext_[i].directive)) {
+      } else if (llvm::omp::allSimdSet.test(dirContext_[i].directive)) {
         isNestedInSIMD = true;
         break;
-      } else if (notAllowedParallelSet.test(dirContext_[i].directive)) {
+      } else if (llvm::omp::nestedOrderedParallelErrSet.test(
+                     dirContext_[i].directive)) {
         isCloselyNestedRegion = false;
         break;
       }
@@ -1018,9 +1172,9 @@ void OmpStructureChecker::CheckThreadprivateOrDeclareTargetVar(
                         ContextDirectiveAsFortran());
                   else if (GetContext().directive ==
                       llvm::omp::Directive::OMPD_declare_target)
-                    context_.Say(name->source,
-                        "The entity with PARAMETER attribute is used in a %s "
-                        "directive"_warn_en_US,
+                    context_.Warn(common::UsageWarning::OpenMPUsage,
+                        name->source,
+                        "The entity with PARAMETER attribute is used in a %s directive"_warn_en_US,
                         ContextDirectiveAsFortran());
                 } else if (FindCommonBlockContaining(*name->symbol)) {
                   context_.Say(name->source,
@@ -1046,7 +1200,7 @@ void OmpStructureChecker::CheckThreadprivateOrDeclareTargetVar(
                       name->symbol->GetUltimate().owner();
                   if (!curScope.IsTopLevel()) {
                     const semantics::Scope &declScope =
-                        GetProgramUnitContaining(curScope);
+                        GetProgramUnitOrBlockConstructContaining(curScope);
                     const semantics::Symbol *sym{
                         declScope.parent().FindSymbol(name->symbol->name())};
                     if (sym &&
@@ -1107,6 +1261,39 @@ void OmpStructureChecker::Leave(const parser::OpenMPDeclareSimdConstruct &) {
   dirContext_.pop_back();
 }
 
+void OmpStructureChecker::Enter(const parser::OpenMPDepobjConstruct &x) {
+  const auto &dir{std::get<parser::Verbatim>(x.t)};
+  PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_depobj);
+
+  // [5.2:73:27-28]
+  // If the destroy clause appears on a depobj construct, destroy-var must
+  // refer to the same depend object as the depobj argument of the construct.
+  auto &clause{std::get<parser::OmpClause>(x.t)};
+  if (clause.Id() == llvm::omp::Clause::OMPC_destroy) {
+    auto getSymbol{[&](const parser::OmpObject &obj) {
+      return common::visit(
+          [&](auto &&s) { return GetLastName(s).symbol; }, obj.u);
+    }};
+
+    auto &wrapper{std::get<parser::OmpClause::Destroy>(clause.u)};
+    if (const std::optional<parser::OmpDestroyClause> &destroy{wrapper.v}) {
+      const Symbol *constrSym{getSymbol(std::get<parser::OmpObject>(x.t))};
+      const Symbol *clauseSym{getSymbol(destroy->v)};
+      assert(constrSym && "Unresolved depobj construct symbol");
+      assert(clauseSym && "Unresolved destroy symbol on depobj construct");
+      if (constrSym != clauseSym) {
+        context_.Say(x.source,
+            "The DESTROY clause must refer to the same object as the "
+            "DEPOBJ construct"_err_en_US);
+      }
+    }
+  }
+}
+
+void OmpStructureChecker::Leave(const parser::OpenMPDepobjConstruct &x) {
+  dirContext_.pop_back();
+}
+
 void OmpStructureChecker::Enter(const parser::OpenMPRequiresConstruct &x) {
   const auto &dir{std::get<parser::Verbatim>(x.t)};
   PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_requires);
@@ -1132,7 +1319,7 @@ void OmpStructureChecker::Leave(const parser::OpenMPDeclarativeAllocate &x) {
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Allocator &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_allocator);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_allocator);
   // Note: Predefined allocators are stored in ScalarExpr as numbers
   //   whereas custom allocators are stored as strings, so if the ScalarExpr
   //   actually has an int value, then it must be a predefined allocator
@@ -1140,12 +1327,95 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Allocator &x) {
   RequiresPositiveParameter(llvm::omp::Clause::OMPC_allocator, x.v);
 }
 
+void OmpStructureChecker::Enter(const parser::OmpClause::Allocate &x) {
+  CheckAllowedClause(llvm::omp::Clause::OMPC_allocate);
+  if (const auto &modifier{
+          std::get<std::optional<parser::OmpAllocateClause::AllocateModifier>>(
+              x.v.t)}) {
+    common::visit(
+        common::visitors{
+            [&](const parser::OmpAllocateClause::AllocateModifier::Allocator
+                    &y) {
+              RequiresPositiveParameter(llvm::omp::Clause::OMPC_allocate, y.v);
+              isPredefinedAllocator = GetIntValue(y.v).has_value();
+            },
+            [&](const parser::OmpAllocateClause::AllocateModifier::
+                    ComplexModifier &y) {
+              const auto &alloc = std::get<
+                  parser::OmpAllocateClause::AllocateModifier::Allocator>(y.t);
+              const auto &align =
+                  std::get<parser::OmpAllocateClause::AllocateModifier::Align>(
+                      y.t);
+              RequiresPositiveParameter(
+                  llvm::omp::Clause::OMPC_allocate, alloc.v);
+              RequiresPositiveParameter(
+                  llvm::omp::Clause::OMPC_allocate, align.v);
+              isPredefinedAllocator = GetIntValue(alloc.v).has_value();
+            },
+            [&](const parser::OmpAllocateClause::AllocateModifier::Align &y) {
+              RequiresPositiveParameter(llvm::omp::Clause::OMPC_allocate, y.v);
+            },
+        },
+        modifier->u);
+  }
+}
+
+void OmpStructureChecker::Enter(const parser::OmpDeclareTargetWithClause &x) {
+  SetClauseSets(llvm::omp::Directive::OMPD_declare_target);
+}
+
+void OmpStructureChecker::Leave(const parser::OmpDeclareTargetWithClause &x) {
+  if (x.v.v.size() > 0) {
+    const parser::OmpClause *enterClause =
+        FindClause(llvm::omp::Clause::OMPC_enter);
+    const parser::OmpClause *toClause = FindClause(llvm::omp::Clause::OMPC_to);
+    const parser::OmpClause *linkClause =
+        FindClause(llvm::omp::Clause::OMPC_link);
+    if (!enterClause && !toClause && !linkClause) {
+      context_.Say(x.source,
+          "If the DECLARE TARGET directive has a clause, it must contain at least one ENTER clause or LINK clause"_err_en_US);
+    }
+    unsigned version{context_.langOptions().OpenMPVersion};
+    if (toClause && version >= 52) {
+      context_.Warn(common::UsageWarning::OpenMPUsage, toClause->source,
+          "The usage of TO clause on DECLARE TARGET directive has been deprecated. Use ENTER clause instead."_warn_en_US);
+    }
+  }
+}
+
 void OmpStructureChecker::Enter(const parser::OpenMPDeclareTargetConstruct &x) {
   const auto &dir{std::get<parser::Verbatim>(x.t)};
   PushContext(dir.source, llvm::omp::Directive::OMPD_declare_target);
-  const auto &spec{std::get<parser::OmpDeclareTargetSpecifier>(x.t)};
-  if (std::holds_alternative<parser::OmpDeclareTargetWithClause>(spec.u)) {
-    SetClauseSets(llvm::omp::Directive::OMPD_declare_target);
+}
+
+void OmpStructureChecker::Enter(const parser::OmpDeclareTargetWithList &x) {
+  SymbolSourceMap symbols;
+  GetSymbolsInObjectList(x.v, symbols);
+  for (auto &[symbol, source] : symbols) {
+    const GenericDetails *genericDetails = symbol->detailsIf<GenericDetails>();
+    if (genericDetails) {
+      context_.Say(source,
+          "The procedure '%s' in DECLARE TARGET construct cannot be a generic name."_err_en_US,
+          symbol->name());
+      genericDetails->specific();
+    }
+    if (IsProcedurePointer(*symbol)) {
+      context_.Say(source,
+          "The procedure '%s' in DECLARE TARGET construct cannot be a procedure pointer."_err_en_US,
+          symbol->name());
+    }
+    const SubprogramDetails *entryDetails =
+        symbol->detailsIf<SubprogramDetails>();
+    if (entryDetails && entryDetails->entryScope()) {
+      context_.Say(source,
+          "The procedure '%s' in DECLARE TARGET construct cannot be an entry name."_err_en_US,
+          symbol->name());
+    }
+    if (IsStmtFunction(*symbol)) {
+      context_.Say(source,
+          "The procedure '%s' in DECLARE TARGET construct cannot be a statement function."_err_en_US,
+          symbol->name());
+    }
   }
 }
 
@@ -1178,22 +1448,54 @@ void OmpStructureChecker::CheckSymbolNames(
 void OmpStructureChecker::Leave(const parser::OpenMPDeclareTargetConstruct &x) {
   const auto &dir{std::get<parser::Verbatim>(x.t)};
   const auto &spec{std::get<parser::OmpDeclareTargetSpecifier>(x.t)};
+  // Handle both forms of DECLARE TARGET.
+  // - Extended list: It behaves as if there was an ENTER/TO clause with the
+  //   list of objects as argument. It accepts no explicit clauses.
+  // - With clauses.
   if (const auto *objectList{parser::Unwrap<parser::OmpObjectList>(spec.u)}) {
+    deviceConstructFound_ = true;
     CheckSymbolNames(dir.source, *objectList);
     CheckIsVarPartOfAnotherVar(dir.source, *objectList);
     CheckThreadprivateOrDeclareTargetVar(*objectList);
   } else if (const auto *clauseList{
                  parser::Unwrap<parser::OmpClauseList>(spec.u)}) {
+    bool toClauseFound{false}, deviceTypeClauseFound{false},
+        enterClauseFound{false};
     for (const auto &clause : clauseList->v) {
-      if (const auto *toClause{std::get_if<parser::OmpClause::To>(&clause.u)}) {
-        CheckSymbolNames(dir.source, toClause->v);
-        CheckIsVarPartOfAnotherVar(dir.source, toClause->v);
-        CheckThreadprivateOrDeclareTargetVar(toClause->v);
-      } else if (const auto *linkClause{
-                     std::get_if<parser::OmpClause::Link>(&clause.u)}) {
-        CheckSymbolNames(dir.source, linkClause->v);
-        CheckIsVarPartOfAnotherVar(dir.source, linkClause->v);
-        CheckThreadprivateOrDeclareTargetVar(linkClause->v);
+      common::visit(
+          common::visitors{
+              [&](const parser::OmpClause::To &toClause) {
+                toClauseFound = true;
+                CheckSymbolNames(dir.source, toClause.v);
+                CheckIsVarPartOfAnotherVar(dir.source, toClause.v);
+                CheckThreadprivateOrDeclareTargetVar(toClause.v);
+              },
+              [&](const parser::OmpClause::Link &linkClause) {
+                CheckSymbolNames(dir.source, linkClause.v);
+                CheckIsVarPartOfAnotherVar(dir.source, linkClause.v);
+                CheckThreadprivateOrDeclareTargetVar(linkClause.v);
+              },
+              [&](const parser::OmpClause::Enter &enterClause) {
+                enterClauseFound = true;
+                CheckSymbolNames(dir.source, enterClause.v);
+                CheckIsVarPartOfAnotherVar(dir.source, enterClause.v);
+                CheckThreadprivateOrDeclareTargetVar(enterClause.v);
+              },
+              [&](const parser::OmpClause::DeviceType &deviceTypeClause) {
+                deviceTypeClauseFound = true;
+                if (deviceTypeClause.v.v !=
+                    parser::OmpDeviceTypeClause::Type::Host) {
+                  // Function / subroutine explicitly marked as runnable by the
+                  // target device.
+                  deviceConstructFound_ = true;
+                }
+              },
+              [&](const auto &) {},
+          },
+          clause.u);
+
+      if ((toClauseFound || enterClauseFound) && !deviceTypeClauseFound) {
+        deviceConstructFound_ = true;
       }
     }
   }
@@ -1215,6 +1517,33 @@ void OmpStructureChecker::Leave(const parser::OpenMPExecutableAllocate &x) {
   const auto &objectList{std::get<std::optional<parser::OmpObjectList>>(x.t)};
   if (objectList)
     CheckPredefinedAllocatorRestriction(dir.source, *objectList);
+  dirContext_.pop_back();
+}
+
+void OmpStructureChecker::Enter(const parser::OpenMPAllocatorsConstruct &x) {
+  isPredefinedAllocator = true;
+  const auto &dir{std::get<parser::Verbatim>(x.t)};
+  PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_allocators);
+  const auto &clauseList{std::get<parser::OmpClauseList>(x.t)};
+  for (const auto &clause : clauseList.v) {
+    if (const auto *allocClause{
+            parser::Unwrap<parser::OmpClause::Allocate>(clause)}) {
+      CheckIsVarPartOfAnotherVar(
+          dir.source, std::get<parser::OmpObjectList>(allocClause->v.t));
+    }
+  }
+}
+
+void OmpStructureChecker::Leave(const parser::OpenMPAllocatorsConstruct &x) {
+  const auto &dir{std::get<parser::Verbatim>(x.t)};
+  const auto &clauseList{std::get<parser::OmpClauseList>(x.t)};
+  for (const auto &clause : clauseList.v) {
+    if (const auto *allocClause{
+            std::get_if<parser::OmpClause::Allocate>(&clause.u)}) {
+      CheckPredefinedAllocatorRestriction(
+          dir.source, std::get<parser::OmpObjectList>(allocClause->v.t));
+    }
+  }
   dirContext_.pop_back();
 }
 
@@ -1275,12 +1604,9 @@ void OmpStructureChecker::ChecksOnOrderedAsStandalone() {
     }
   }
 
-  OmpDirectiveSet allowedDoSet{llvm::omp::Directive::OMPD_do,
-      llvm::omp::Directive::OMPD_parallel_do,
-      llvm::omp::Directive::OMPD_target_parallel_do};
   bool isNestedInDoOrderedWithPara{false};
   if (CurrentDirectiveIsNested() &&
-      allowedDoSet.test(GetContextParent().directive)) {
+      llvm::omp::nestedOrderedDoAllowedSet.test(GetContextParent().directive)) {
     if (const auto *clause{
             FindClause(GetContextParent(), llvm::omp::Clause::OMPC_ordered)}) {
       const auto &orderedClause{
@@ -1320,6 +1646,36 @@ void OmpStructureChecker::CheckOrderedDependClause(
   }
 }
 
+void OmpStructureChecker::CheckTargetUpdate() {
+  const parser::OmpClause *toClause = FindClause(llvm::omp::Clause::OMPC_to);
+  const parser::OmpClause *fromClause =
+      FindClause(llvm::omp::Clause::OMPC_from);
+  if (!toClause && !fromClause) {
+    context_.Say(GetContext().directiveSource,
+        "At least one motion-clause (TO/FROM) must be specified on TARGET UPDATE construct."_err_en_US);
+  }
+  if (toClause && fromClause) {
+    SymbolSourceMap toSymbols, fromSymbols;
+    GetSymbolsInObjectList(
+        std::get<parser::OmpClause::To>(toClause->u).v, toSymbols);
+    GetSymbolsInObjectList(
+        std::get<parser::OmpClause::From>(fromClause->u).v, fromSymbols);
+    for (auto &[symbol, source] : toSymbols) {
+      auto fromSymbol = fromSymbols.find(symbol);
+      if (fromSymbol != fromSymbols.end()) {
+        context_.Say(source,
+            "A list item ('%s') can only appear in a TO or FROM clause, but not in both."_err_en_US,
+            symbol->name());
+        context_.Say(source, "'%s' appears in the TO clause."_because_en_US,
+            symbol->name());
+        context_.Say(fromSymbol->second,
+            "'%s' appears in the FROM clause."_because_en_US,
+            fromSymbol->first->name());
+      }
+    }
+  }
+}
+
 void OmpStructureChecker::Enter(
     const parser::OpenMPSimpleStandaloneConstruct &x) {
   const auto &dir{std::get<parser::OmpSimpleStandaloneDirective>(x.t)};
@@ -1328,11 +1684,14 @@ void OmpStructureChecker::Enter(
 }
 
 void OmpStructureChecker::Leave(
-    const parser::OpenMPSimpleStandaloneConstruct &) {
+    const parser::OpenMPSimpleStandaloneConstruct &x) {
   switch (GetContext().directive) {
   case llvm::omp::Directive::OMPD_ordered:
     // [5.1] 2.19.9 Ordered Construct Restriction
     ChecksOnOrderedAsStandalone();
+    break;
+  case llvm::omp::Directive::OMPD_target_update:
+    CheckTargetUpdate();
     break;
   default:
     break;
@@ -1438,24 +1797,11 @@ void OmpStructureChecker::CheckCancellationNest(
     // cancellation construct must be closely nested inside an OpenMP construct
     // that matches the type specified in construct-type-clause of the
     // cancellation construct.
-
-    OmpDirectiveSet allowedTaskgroupSet{
-        llvm::omp::Directive::OMPD_task, llvm::omp::Directive::OMPD_taskloop};
-    OmpDirectiveSet allowedSectionsSet{llvm::omp::Directive::OMPD_sections,
-        llvm::omp::Directive::OMPD_parallel_sections};
-    OmpDirectiveSet allowedDoSet{llvm::omp::Directive::OMPD_do,
-        llvm::omp::Directive::OMPD_distribute_parallel_do,
-        llvm::omp::Directive::OMPD_parallel_do,
-        llvm::omp::Directive::OMPD_target_parallel_do,
-        llvm::omp::Directive::OMPD_target_teams_distribute_parallel_do,
-        llvm::omp::Directive::OMPD_teams_distribute_parallel_do};
-    OmpDirectiveSet allowedParallelSet{llvm::omp::Directive::OMPD_parallel,
-        llvm::omp::Directive::OMPD_target_parallel};
-
     bool eligibleCancellation{false};
     switch (type) {
     case parser::OmpCancelType::Type::Taskgroup:
-      if (allowedTaskgroupSet.test(GetContextParent().directive)) {
+      if (llvm::omp::nestedCancelTaskgroupAllowedSet.test(
+              GetContextParent().directive)) {
         eligibleCancellation = true;
         if (dirContext_.size() >= 3) {
           // Check if the cancellation region is closely nested inside a
@@ -1468,7 +1814,8 @@ void OmpStructureChecker::CheckCancellationNest(
                   llvm::omp::Directive::OMPD_taskgroup) {
                 break;
               }
-              if (allowedParallelSet.test(dirContext_[i].directive)) {
+              if (llvm::omp::nestedCancelParallelAllowedSet.test(
+                      dirContext_[i].directive)) {
                 eligibleCancellation = false;
                 break;
               }
@@ -1487,17 +1834,20 @@ void OmpStructureChecker::CheckCancellationNest(
       }
       return;
     case parser::OmpCancelType::Type::Sections:
-      if (allowedSectionsSet.test(GetContextParent().directive)) {
+      if (llvm::omp::nestedCancelSectionsAllowedSet.test(
+              GetContextParent().directive)) {
         eligibleCancellation = true;
       }
       break;
     case Fortran::parser::OmpCancelType::Type::Do:
-      if (allowedDoSet.test(GetContextParent().directive)) {
+      if (llvm::omp::nestedCancelDoAllowedSet.test(
+              GetContextParent().directive)) {
         eligibleCancellation = true;
       }
       break;
     case parser::OmpCancelType::Type::Parallel:
-      if (allowedParallelSet.test(GetContextParent().directive)) {
+      if (llvm::omp::nestedCancelParallelAllowedSet.test(
+              GetContextParent().directive)) {
         eligibleCancellation = true;
       }
       break;
@@ -1554,6 +1904,9 @@ void OmpStructureChecker::Enter(const parser::OmpEndBlockDirective &x) {
   const auto &dir{std::get<parser::OmpBlockDirective>(x.t)};
   ResetPartialContext(dir.source);
   switch (dir.v) {
+  case llvm::omp::Directive::OMPD_scope:
+    PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_end_scope);
+    break;
   // 2.7.3 end-single-clause -> copyprivate-clause |
   //                            nowait-clause
   case llvm::omp::Directive::OMPD_single:
@@ -1576,9 +1929,89 @@ void OmpStructureChecker::Enter(const parser::OmpEndBlockDirective &x) {
 // end_workshareare popped as they are pushed while entering the
 // EndBlockDirective.
 void OmpStructureChecker::Leave(const parser::OmpEndBlockDirective &x) {
-  if ((GetContext().directive == llvm::omp::Directive::OMPD_end_single) ||
+  if ((GetContext().directive == llvm::omp::Directive::OMPD_end_scope) ||
+      (GetContext().directive == llvm::omp::Directive::OMPD_end_single) ||
       (GetContext().directive == llvm::omp::Directive::OMPD_end_workshare)) {
     dirContext_.pop_back();
+  }
+}
+
+inline void OmpStructureChecker::ErrIfAllocatableVariable(
+    const parser::Variable &var) {
+  // Err out if the given symbol has
+  // ALLOCATABLE attribute
+  if (const auto *e{GetExpr(context_, var)})
+    for (const Symbol &symbol : evaluate::CollectSymbols(*e))
+      if (IsAllocatable(symbol)) {
+        const auto &designator =
+            std::get<common::Indirection<parser::Designator>>(var.u);
+        const auto *dataRef =
+            std::get_if<Fortran::parser::DataRef>(&designator.value().u);
+        const Fortran::parser::Name *name =
+            dataRef ? std::get_if<Fortran::parser::Name>(&dataRef->u) : nullptr;
+        if (name)
+          context_.Say(name->source,
+              "%s must not have ALLOCATABLE "
+              "attribute"_err_en_US,
+              name->ToString());
+      }
+}
+
+inline void OmpStructureChecker::ErrIfLHSAndRHSSymbolsMatch(
+    const parser::Variable &var, const parser::Expr &expr) {
+  // Err out if the symbol on the LHS is also used on the RHS of the assignment
+  // statement
+  const auto *e{GetExpr(context_, expr)};
+  const auto *v{GetExpr(context_, var)};
+  if (e && v) {
+    auto vSyms{evaluate::GetSymbolVector(*v)};
+    const Symbol &varSymbol = vSyms.front();
+    for (const Symbol &symbol : evaluate::GetSymbolVector(*e)) {
+      if (varSymbol == symbol) {
+        const Fortran::common::Indirection<Fortran::parser::Designator>
+            *designator = std::get_if<
+                Fortran::common::Indirection<Fortran::parser::Designator>>(
+                &expr.u);
+        if (designator) {
+          auto *z{var.typedExpr.get()};
+          auto *c{expr.typedExpr.get()};
+          if (z->v == c->v) {
+            context_.Say(expr.source,
+                "RHS expression on atomic assignment statement cannot access '%s'"_err_en_US,
+                var.GetSource());
+          }
+        } else {
+          context_.Say(expr.source,
+              "RHS expression on atomic assignment statement cannot access '%s'"_err_en_US,
+              var.GetSource());
+        }
+      }
+    }
+  }
+}
+
+inline void OmpStructureChecker::ErrIfNonScalarAssignmentStmt(
+    const parser::Variable &var, const parser::Expr &expr) {
+  // Err out if either the variable on the LHS or the expression on the RHS of
+  // the assignment statement are non-scalar (i.e. have rank > 0 or is of
+  // CHARACTER type)
+  const auto *e{GetExpr(context_, expr)};
+  const auto *v{GetExpr(context_, var)};
+  if (e && v) {
+    if (e->Rank() != 0 ||
+        (e->GetType().has_value() &&
+            e->GetType().value().category() == common::TypeCategory::Character))
+      context_.Say(expr.source,
+          "Expected scalar expression "
+          "on the RHS of atomic assignment "
+          "statement"_err_en_US);
+    if (v->Rank() != 0 ||
+        (v->GetType().has_value() &&
+            v->GetType()->category() == common::TypeCategory::Character))
+      context_.Say(var.GetSource(),
+          "Expected scalar variable "
+          "on the LHS of atomic assignment "
+          "statement"_err_en_US);
   }
 }
 
@@ -1602,22 +2035,64 @@ bool OmpStructureChecker::IsOperatorValid(const T &node, const D &variable) {
     if ((exprLeft.value().source.ToString() != variableName) &&
         (exprRight.value().source.ToString() != variableName)) {
       context_.Say(variable.GetSource(),
-          "Atomic update variable '%s' not found in the RHS of the "
-          "assignment statement in an ATOMIC (UPDATE) construct"_err_en_US,
-          variableName);
+          "Atomic update statement should be of form "
+          "`%s = %s operator expr` OR `%s = expr operator %s`"_err_en_US,
+          variableName, variableName, variableName, variableName);
     }
     return common::HasMember<T, AllowedBinaryOperators>;
   }
-  return true;
+  return false;
 }
 
-void OmpStructureChecker::CheckAtomicUpdateAssignmentStmt(
+void OmpStructureChecker::CheckAtomicCaptureStmt(
+    const parser::AssignmentStmt &assignmentStmt) {
+  const auto &var{std::get<parser::Variable>(assignmentStmt.t)};
+  const auto &expr{std::get<parser::Expr>(assignmentStmt.t)};
+  common::visit(
+      common::visitors{
+          [&](const common::Indirection<parser::Designator> &designator) {
+            const auto *dataRef =
+                std::get_if<Fortran::parser::DataRef>(&designator.value().u);
+            const auto *name = dataRef
+                ? std::get_if<Fortran::parser::Name>(&dataRef->u)
+                : nullptr;
+            if (name && IsAllocatable(*name->symbol))
+              context_.Say(name->source,
+                  "%s must not have ALLOCATABLE "
+                  "attribute"_err_en_US,
+                  name->ToString());
+          },
+          [&](const auto &) {
+            // Anything other than a `parser::Designator` is not allowed
+            context_.Say(expr.source,
+                "Expected scalar variable "
+                "of intrinsic type on RHS of atomic "
+                "assignment statement"_err_en_US);
+          }},
+      expr.u);
+  ErrIfLHSAndRHSSymbolsMatch(var, expr);
+  ErrIfNonScalarAssignmentStmt(var, expr);
+}
+
+void OmpStructureChecker::CheckAtomicWriteStmt(
+    const parser::AssignmentStmt &assignmentStmt) {
+  const auto &var{std::get<parser::Variable>(assignmentStmt.t)};
+  const auto &expr{std::get<parser::Expr>(assignmentStmt.t)};
+  ErrIfAllocatableVariable(var);
+  ErrIfLHSAndRHSSymbolsMatch(var, expr);
+  ErrIfNonScalarAssignmentStmt(var, expr);
+}
+
+void OmpStructureChecker::CheckAtomicUpdateStmt(
     const parser::AssignmentStmt &assignment) {
   const auto &expr{std::get<parser::Expr>(assignment.t)};
   const auto &var{std::get<parser::Variable>(assignment.t)};
+  bool isIntrinsicProcedure{false};
+  bool isValidOperator{false};
   common::visit(
       common::visitors{
           [&](const common::Indirection<parser::FunctionReference> &x) {
+            isIntrinsicProcedure = true;
             const auto &procedureDesignator{
                 std::get<parser::ProcedureDesignator>(x.value().v.t)};
             const parser::Name *name{
@@ -1629,46 +2104,120 @@ void OmpStructureChecker::CheckAtomicUpdateAssignmentStmt(
               context_.Say(expr.source,
                   "Invalid intrinsic procedure name in "
                   "OpenMP ATOMIC (UPDATE) statement"_err_en_US);
-            } else if (name) {
-              bool foundMatch{false};
-              if (auto varDesignatorIndirection =
-                      std::get_if<Fortran::common::Indirection<
-                          Fortran::parser::Designator>>(&var.u)) {
-                const auto &varDesignator = varDesignatorIndirection->value();
-                if (const auto *dataRef = std::get_if<Fortran::parser::DataRef>(
-                        &varDesignator.u)) {
-                  if (const auto *name =
-                          std::get_if<Fortran::parser::Name>(&dataRef->u)) {
-                    const auto &varSymbol = *name->symbol;
-                    if (const auto *e{GetExpr(context_, expr)}) {
-                      for (const Symbol &symbol :
-                          evaluate::CollectSymbols(*e)) {
-                        if (symbol == varSymbol) {
-                          foundMatch = true;
-                          break;
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-              if (!foundMatch) {
-                context_.Say(expr.source,
-                    "Atomic update variable '%s' not found in the "
-                    "argument list of intrinsic procedure"_err_en_US,
-                    var.GetSource().ToString());
-              }
             }
           },
           [&](const auto &x) {
             if (!IsOperatorValid(x, var)) {
               context_.Say(expr.source,
-                  "Invalid operator in OpenMP ATOMIC (UPDATE) "
+                  "Invalid or missing operator in atomic update "
                   "statement"_err_en_US);
-            }
+            } else
+              isValidOperator = true;
           },
       },
       expr.u);
+  if (const auto *e{GetExpr(context_, expr)}) {
+    const auto *v{GetExpr(context_, var)};
+    if (e->Rank() != 0 ||
+        (e->GetType().has_value() &&
+            e->GetType().value().category() == common::TypeCategory::Character))
+      context_.Say(expr.source,
+          "Expected scalar expression "
+          "on the RHS of atomic update assignment "
+          "statement"_err_en_US);
+    if (v->Rank() != 0 ||
+        (v->GetType().has_value() &&
+            v->GetType()->category() == common::TypeCategory::Character))
+      context_.Say(var.GetSource(),
+          "Expected scalar variable "
+          "on the LHS of atomic update assignment "
+          "statement"_err_en_US);
+    auto vSyms{evaluate::GetSymbolVector(*v)};
+    const Symbol &varSymbol = vSyms.front();
+    int numOfSymbolMatches{0};
+    SymbolVector exprSymbols{evaluate::GetSymbolVector(*e)};
+    for (const Symbol &symbol : exprSymbols) {
+      if (varSymbol == symbol) {
+        numOfSymbolMatches++;
+      }
+    }
+    if (isIntrinsicProcedure) {
+      std::string varName = var.GetSource().ToString();
+      if (numOfSymbolMatches != 1)
+        context_.Say(expr.source,
+            "Intrinsic procedure"
+            " arguments in atomic update statement"
+            " must have exactly one occurence of '%s'"_err_en_US,
+            varName);
+      else if (varSymbol != exprSymbols.front() &&
+          varSymbol != exprSymbols.back())
+        context_.Say(expr.source,
+            "Atomic update statement "
+            "should be of the form `%s = intrinsic_procedure(%s, expr_list)` "
+            "OR `%s = intrinsic_procedure(expr_list, %s)`"_err_en_US,
+            varName, varName, varName, varName);
+    } else if (isValidOperator) {
+      if (numOfSymbolMatches != 1)
+        context_.Say(expr.source,
+            "Exactly one occurence of '%s' "
+            "expected on the RHS of atomic update assignment statement"_err_en_US,
+            var.GetSource().ToString());
+    }
+  }
+
+  ErrIfAllocatableVariable(var);
+}
+
+// TODO: Allow cond-update-stmt once compare clause is supported.
+void OmpStructureChecker::CheckAtomicCaptureConstruct(
+    const parser::OmpAtomicCapture &atomicCaptureConstruct) {
+  const Fortran::parser::AssignmentStmt &stmt1 =
+      std::get<Fortran::parser::OmpAtomicCapture::Stmt1>(
+          atomicCaptureConstruct.t)
+          .v.statement;
+  const auto &stmt1Var{std::get<Fortran::parser::Variable>(stmt1.t)};
+  const auto &stmt1Expr{std::get<Fortran::parser::Expr>(stmt1.t)};
+
+  const Fortran::parser::AssignmentStmt &stmt2 =
+      std::get<Fortran::parser::OmpAtomicCapture::Stmt2>(
+          atomicCaptureConstruct.t)
+          .v.statement;
+  const auto &stmt2Var{std::get<Fortran::parser::Variable>(stmt2.t)};
+  const auto &stmt2Expr{std::get<Fortran::parser::Expr>(stmt2.t)};
+
+  if (Fortran::semantics::checkForSingleVariableOnRHS(stmt1)) {
+    CheckAtomicCaptureStmt(stmt1);
+    if (Fortran::semantics::checkForSymbolMatch(stmt2)) {
+      // ATOMIC CAPTURE construct is of the form [capture-stmt, update-stmt]
+      CheckAtomicUpdateStmt(stmt2);
+    } else {
+      // ATOMIC CAPTURE construct is of the form [capture-stmt, write-stmt]
+      CheckAtomicWriteStmt(stmt2);
+    }
+    auto *v{stmt2Var.typedExpr.get()};
+    auto *e{stmt1Expr.typedExpr.get()};
+    if (v && e && !(v->v == e->v)) {
+      context_.Say(stmt1Expr.source,
+          "Captured variable/array element/derived-type component %s expected to be assigned in the second statement of ATOMIC CAPTURE construct"_err_en_US,
+          stmt1Expr.source);
+    }
+  } else if (Fortran::semantics::checkForSymbolMatch(stmt1) &&
+      Fortran::semantics::checkForSingleVariableOnRHS(stmt2)) {
+    // ATOMIC CAPTURE construct is of the form [update-stmt, capture-stmt]
+    CheckAtomicUpdateStmt(stmt1);
+    CheckAtomicCaptureStmt(stmt2);
+    // Variable updated in stmt1 should be captured in stmt2
+    auto *v{stmt1Var.typedExpr.get()};
+    auto *e{stmt2Expr.typedExpr.get()};
+    if (v && e && !(v->v == e->v)) {
+      context_.Say(stmt1Var.GetSource(),
+          "Updated variable/array element/derived-type component %s expected to be captured in the second statement of ATOMIC CAPTURE construct"_err_en_US,
+          stmt1Var.GetSource());
+    }
+  } else {
+    context_.Say(stmt1Expr.source,
+        "Invalid ATOMIC CAPTURE construct statements. Expected one of [update-stmt, capture-stmt], [capture-stmt, update-stmt], or [capture-stmt, write-stmt]"_err_en_US);
+  }
 }
 
 void OmpStructureChecker::CheckAtomicMemoryOrderClause(
@@ -1704,7 +2253,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
             const auto &dir{std::get<parser::Verbatim>(atomicConstruct.t)};
             PushContextAndClauseSets(
                 dir.source, llvm::omp::Directive::OMPD_atomic);
-            CheckAtomicUpdateAssignmentStmt(
+            CheckAtomicUpdateStmt(
                 std::get<parser::Statement<parser::AssignmentStmt>>(
                     atomicConstruct.t)
                     .statement);
@@ -1719,7 +2268,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
             const auto &dir{std::get<parser::Verbatim>(atomicUpdate.t)};
             PushContextAndClauseSets(
                 dir.source, llvm::omp::Directive::OMPD_atomic);
-            CheckAtomicUpdateAssignmentStmt(
+            CheckAtomicUpdateStmt(
                 std::get<parser::Statement<parser::AssignmentStmt>>(
                     atomicUpdate.t)
                     .statement);
@@ -1728,15 +2277,41 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
             CheckHintClause<const parser::OmpAtomicClauseList>(
                 &std::get<0>(atomicUpdate.t), &std::get<2>(atomicUpdate.t));
           },
-          [&](const auto &atomicConstruct) {
-            const auto &dir{std::get<parser::Verbatim>(atomicConstruct.t)};
+          [&](const parser::OmpAtomicRead &atomicRead) {
+            const auto &dir{std::get<parser::Verbatim>(atomicRead.t)};
             PushContextAndClauseSets(
                 dir.source, llvm::omp::Directive::OMPD_atomic);
-            CheckAtomicMemoryOrderClause(&std::get<0>(atomicConstruct.t),
-                &std::get<2>(atomicConstruct.t));
+            CheckAtomicMemoryOrderClause(
+                &std::get<0>(atomicRead.t), &std::get<2>(atomicRead.t));
             CheckHintClause<const parser::OmpAtomicClauseList>(
-                &std::get<0>(atomicConstruct.t),
-                &std::get<2>(atomicConstruct.t));
+                &std::get<0>(atomicRead.t), &std::get<2>(atomicRead.t));
+            CheckAtomicCaptureStmt(
+                std::get<parser::Statement<parser::AssignmentStmt>>(
+                    atomicRead.t)
+                    .statement);
+          },
+          [&](const parser::OmpAtomicWrite &atomicWrite) {
+            const auto &dir{std::get<parser::Verbatim>(atomicWrite.t)};
+            PushContextAndClauseSets(
+                dir.source, llvm::omp::Directive::OMPD_atomic);
+            CheckAtomicMemoryOrderClause(
+                &std::get<0>(atomicWrite.t), &std::get<2>(atomicWrite.t));
+            CheckHintClause<const parser::OmpAtomicClauseList>(
+                &std::get<0>(atomicWrite.t), &std::get<2>(atomicWrite.t));
+            CheckAtomicWriteStmt(
+                std::get<parser::Statement<parser::AssignmentStmt>>(
+                    atomicWrite.t)
+                    .statement);
+          },
+          [&](const parser::OmpAtomicCapture &atomicCapture) {
+            const auto &dir{std::get<parser::Verbatim>(atomicCapture.t)};
+            PushContextAndClauseSets(
+                dir.source, llvm::omp::Directive::OMPD_atomic);
+            CheckAtomicMemoryOrderClause(
+                &std::get<0>(atomicCapture.t), &std::get<2>(atomicCapture.t));
+            CheckHintClause<const parser::OmpAtomicClauseList>(
+                &std::get<0>(atomicCapture.t), &std::get<2>(atomicCapture.t));
+            CheckAtomicCaptureConstruct(atomicCapture);
           },
       },
       x.u);
@@ -1754,7 +2329,7 @@ void OmpStructureChecker::Leave(const parser::OpenMPAtomicConstruct &) {
 
 void OmpStructureChecker::Leave(const parser::OmpClauseList &) {
   // 2.7.1 Loop Construct Restriction
-  if (llvm::omp::doSet.test(GetContext().directive)) {
+  if (llvm::omp::allDoSet.test(GetContext().directive)) {
     if (auto *clause{FindClause(llvm::omp::Clause::OMPC_schedule)}) {
       // only one schedule clause is allowed
       const auto &schedClause{std::get<parser::OmpClause::Schedule>(clause->u)};
@@ -1805,7 +2380,7 @@ void OmpStructureChecker::Leave(const parser::OmpClauseList &) {
   } // doSet
 
   // 2.8.1 Simd Construct Restriction
-  if (llvm::omp::simdSet.test(GetContext().directive)) {
+  if (llvm::omp::allSimdSet.test(GetContext().directive)) {
     if (auto *clause{FindClause(llvm::omp::Clause::OMPC_simdlen)}) {
       if (auto *clause2{FindClause(llvm::omp::Clause::OMPC_safelen)}) {
         const auto &simdlenClause{
@@ -1824,6 +2399,21 @@ void OmpStructureChecker::Leave(const parser::OmpClauseList &) {
         }
       }
     }
+
+    // 2.11.5 Simd construct restriction (OpenMP 5.1)
+    if (auto *sl_clause{FindClause(llvm::omp::Clause::OMPC_safelen)}) {
+      if (auto *o_clause{FindClause(llvm::omp::Clause::OMPC_order)}) {
+        const auto &orderClause{
+            std::get<parser::OmpClause::Order>(o_clause->u)};
+        if (std::get<parser::OmpOrderClause::Type>(orderClause.v.t) ==
+            parser::OmpOrderClause::Type::Concurrent) {
+          context_.Say(sl_clause->source,
+              "The `SAFELEN` clause cannot appear in the `SIMD` directive "
+              "with `ORDER(CONCURRENT)` clause"_err_en_US);
+        }
+      }
+    }
+
     // Sema checks related to presence of multiple list items within the same
     // clause
     CheckMultListItems();
@@ -1886,46 +2476,68 @@ void OmpStructureChecker::Leave(const parser::OmpClauseList &) {
 
 void OmpStructureChecker::Enter(const parser::OmpClause &x) {
   SetContextClause(x);
+
+  // The visitors for these clauses do their own checks.
+  switch (x.Id()) {
+  case llvm::omp::Clause::OMPC_copyprivate:
+  case llvm::omp::Clause::OMPC_enter:
+  case llvm::omp::Clause::OMPC_lastprivate:
+  case llvm::omp::Clause::OMPC_reduction:
+  case llvm::omp::Clause::OMPC_to:
+    return;
+  default:
+    break;
+  }
+
+  if (const parser::OmpObjectList * objList{GetOmpObjectList(x)}) {
+    SymbolSourceMap symbols;
+    GetSymbolsInObjectList(*objList, symbols);
+    for (const auto &[sym, source] : symbols) {
+      if (!IsVariableListItem(*sym)) {
+        deferredNonVariables_.insert({sym, source});
+      }
+    }
+  }
 }
 
 // Following clauses do not have a separate node in parse-tree.h.
+CHECK_SIMPLE_CLAUSE(Absent, OMPC_absent)
 CHECK_SIMPLE_CLAUSE(AcqRel, OMPC_acq_rel)
 CHECK_SIMPLE_CLAUSE(Acquire, OMPC_acquire)
-CHECK_SIMPLE_CLAUSE(AtomicDefaultMemOrder, OMPC_atomic_default_mem_order)
 CHECK_SIMPLE_CLAUSE(Affinity, OMPC_affinity)
-CHECK_SIMPLE_CLAUSE(Allocate, OMPC_allocate)
 CHECK_SIMPLE_CLAUSE(Capture, OMPC_capture)
+CHECK_SIMPLE_CLAUSE(Contains, OMPC_contains)
 CHECK_SIMPLE_CLAUSE(Default, OMPC_default)
 CHECK_SIMPLE_CLAUSE(Depobj, OMPC_depobj)
-CHECK_SIMPLE_CLAUSE(Destroy, OMPC_destroy)
 CHECK_SIMPLE_CLAUSE(Detach, OMPC_detach)
 CHECK_SIMPLE_CLAUSE(DeviceType, OMPC_device_type)
 CHECK_SIMPLE_CLAUSE(DistSchedule, OMPC_dist_schedule)
-CHECK_SIMPLE_CLAUSE(DynamicAllocators, OMPC_dynamic_allocators)
 CHECK_SIMPLE_CLAUSE(Exclusive, OMPC_exclusive)
 CHECK_SIMPLE_CLAUSE(Final, OMPC_final)
 CHECK_SIMPLE_CLAUSE(Flush, OMPC_flush)
 CHECK_SIMPLE_CLAUSE(From, OMPC_from)
 CHECK_SIMPLE_CLAUSE(Full, OMPC_full)
+CHECK_SIMPLE_CLAUSE(Grainsize, OMPC_grainsize)
 CHECK_SIMPLE_CLAUSE(Hint, OMPC_hint)
+CHECK_SIMPLE_CLAUSE(Holds, OMPC_holds)
 CHECK_SIMPLE_CLAUSE(InReduction, OMPC_in_reduction)
 CHECK_SIMPLE_CLAUSE(Inclusive, OMPC_inclusive)
 CHECK_SIMPLE_CLAUSE(Match, OMPC_match)
 CHECK_SIMPLE_CLAUSE(Nontemporal, OMPC_nontemporal)
+CHECK_SIMPLE_CLAUSE(NumTasks, OMPC_num_tasks)
 CHECK_SIMPLE_CLAUSE(Order, OMPC_order)
 CHECK_SIMPLE_CLAUSE(Read, OMPC_read)
-CHECK_SIMPLE_CLAUSE(ReverseOffload, OMPC_reverse_offload)
 CHECK_SIMPLE_CLAUSE(Threadprivate, OMPC_threadprivate)
 CHECK_SIMPLE_CLAUSE(Threads, OMPC_threads)
 CHECK_SIMPLE_CLAUSE(Inbranch, OMPC_inbranch)
-CHECK_SIMPLE_CLAUSE(IsDevicePtr, OMPC_is_device_ptr)
-CHECK_SIMPLE_CLAUSE(HasDeviceAddr, OMPC_has_device_addr)
 CHECK_SIMPLE_CLAUSE(Link, OMPC_link)
 CHECK_SIMPLE_CLAUSE(Indirect, OMPC_indirect)
 CHECK_SIMPLE_CLAUSE(Mergeable, OMPC_mergeable)
+CHECK_SIMPLE_CLAUSE(NoOpenmp, OMPC_no_openmp)
+CHECK_SIMPLE_CLAUSE(NoOpenmpRoutines, OMPC_no_openmp_routines)
+CHECK_SIMPLE_CLAUSE(NoParallelism, OMPC_no_parallelism)
 CHECK_SIMPLE_CLAUSE(Nogroup, OMPC_nogroup)
 CHECK_SIMPLE_CLAUSE(Notinbranch, OMPC_notinbranch)
-CHECK_SIMPLE_CLAUSE(Nowait, OMPC_nowait)
 CHECK_SIMPLE_CLAUSE(Partial, OMPC_partial)
 CHECK_SIMPLE_CLAUSE(ProcBind, OMPC_proc_bind)
 CHECK_SIMPLE_CLAUSE(Release, OMPC_release)
@@ -1933,17 +2545,12 @@ CHECK_SIMPLE_CLAUSE(Relaxed, OMPC_relaxed)
 CHECK_SIMPLE_CLAUSE(SeqCst, OMPC_seq_cst)
 CHECK_SIMPLE_CLAUSE(Simd, OMPC_simd)
 CHECK_SIMPLE_CLAUSE(Sizes, OMPC_sizes)
+CHECK_SIMPLE_CLAUSE(Permutation, OMPC_permutation)
 CHECK_SIMPLE_CLAUSE(TaskReduction, OMPC_task_reduction)
-CHECK_SIMPLE_CLAUSE(To, OMPC_to)
-CHECK_SIMPLE_CLAUSE(UnifiedAddress, OMPC_unified_address)
-CHECK_SIMPLE_CLAUSE(UnifiedSharedMemory, OMPC_unified_shared_memory)
 CHECK_SIMPLE_CLAUSE(Uniform, OMPC_uniform)
 CHECK_SIMPLE_CLAUSE(Unknown, OMPC_unknown)
 CHECK_SIMPLE_CLAUSE(Untied, OMPC_untied)
-CHECK_SIMPLE_CLAUSE(UseDevicePtr, OMPC_use_device_ptr)
 CHECK_SIMPLE_CLAUSE(UsesAllocators, OMPC_uses_allocators)
-CHECK_SIMPLE_CLAUSE(Update, OMPC_update)
-CHECK_SIMPLE_CLAUSE(UseDeviceAddr, OMPC_use_device_addr)
 CHECK_SIMPLE_CLAUSE(Write, OMPC_write)
 CHECK_SIMPLE_CLAUSE(Init, OMPC_init)
 CHECK_SIMPLE_CLAUSE(Use, OMPC_use)
@@ -1962,9 +2569,11 @@ CHECK_SIMPLE_CLAUSE(Align, OMPC_align)
 CHECK_SIMPLE_CLAUSE(Compare, OMPC_compare)
 CHECK_SIMPLE_CLAUSE(CancellationConstructType, OMPC_cancellation_construct_type)
 CHECK_SIMPLE_CLAUSE(Doacross, OMPC_doacross)
+CHECK_SIMPLE_CLAUSE(OmpxAttribute, OMPC_ompx_attribute)
+CHECK_SIMPLE_CLAUSE(OmpxBare, OMPC_ompx_bare)
+CHECK_SIMPLE_CLAUSE(Fail, OMPC_fail)
+CHECK_SIMPLE_CLAUSE(Weak, OMPC_weak)
 
-CHECK_REQ_SCALAR_INT_CLAUSE(Grainsize, OMPC_grainsize)
-CHECK_REQ_SCALAR_INT_CLAUSE(NumTasks, OMPC_num_tasks)
 CHECK_REQ_SCALAR_INT_CLAUSE(NumTeams, OMPC_num_teams)
 CHECK_REQ_SCALAR_INT_CLAUSE(NumThreads, OMPC_num_threads)
 CHECK_REQ_SCALAR_INT_CLAUSE(OmpxDynCgroupMem, OMPC_ompx_dyn_cgroup_mem)
@@ -1977,37 +2586,63 @@ CHECK_REQ_CONSTANT_SCALAR_INT_CLAUSE(Simdlen, OMPC_simdlen)
 
 // Restrictions specific to each clause are implemented apart from the
 // generalized restrictions.
+
+void OmpStructureChecker::Enter(const parser::OmpClause::Destroy &x) {
+  CheckAllowedClause(llvm::omp::Clause::OMPC_destroy);
+
+  llvm::omp::Directive dir{GetContext().directive};
+  unsigned version{context_.langOptions().OpenMPVersion};
+  if (dir == llvm::omp::Directive::OMPD_depobj) {
+    if (version < 52) {
+      context_.Say(GetContext().clauseSource,
+          "The object parameter in DESTROY clause in DEPOPJ construct "
+          "was introduced in %s"_port_en_US,
+          ThisVersion(52));
+    }
+  }
+}
+
 void OmpStructureChecker::Enter(const parser::OmpClause::Reduction &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_reduction);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_reduction);
   if (CheckReductionOperators(x)) {
     CheckReductionTypeList(x);
   }
+  CheckReductionModifier(x);
 }
+
 bool OmpStructureChecker::CheckReductionOperators(
     const parser::OmpClause::Reduction &x) {
 
-  const auto &definedOp{std::get<0>(x.v.t)};
+  const auto &definedOp{std::get<parser::OmpReductionOperator>(x.v.t)};
   bool ok = false;
   common::visit(
       common::visitors{
           [&](const parser::DefinedOperator &dOpr) {
-            const auto &intrinsicOp{
-                std::get<parser::DefinedOperator::IntrinsicOperator>(dOpr.u)};
-            ok = CheckIntrinsicOperator(intrinsicOp);
+            if (const auto *intrinsicOp{
+                    std::get_if<parser::DefinedOperator::IntrinsicOperator>(
+                        &dOpr.u)}) {
+              ok = CheckIntrinsicOperator(*intrinsicOp);
+            } else {
+              context_.Say(GetContext().clauseSource,
+                  "Invalid reduction operator in REDUCTION clause."_err_en_US,
+                  ContextDirectiveAsFortran());
+            }
           },
           [&](const parser::ProcedureDesignator &procD) {
             const parser::Name *name{std::get_if<parser::Name>(&procD.u)};
-            if (name) {
-              if (name->source == "max" || name->source == "min" ||
-                  name->source == "iand" || name->source == "ior" ||
-                  name->source == "ieor") {
+            if (name && name->symbol) {
+              const SourceName &realName{name->symbol->GetUltimate().name()};
+              if (realName == "max" || realName == "min" ||
+                  realName == "iand" || realName == "ior" ||
+                  realName == "ieor") {
                 ok = true;
-              } else {
-                context_.Say(GetContext().clauseSource,
-                    "Invalid reduction identifier in REDUCTION "
-                    "clause."_err_en_US,
-                    ContextDirectiveAsFortran());
               }
+            }
+            if (!ok) {
+              context_.Say(GetContext().clauseSource,
+                  "Invalid reduction identifier in REDUCTION "
+                  "clause."_err_en_US,
+                  ContextDirectiveAsFortran());
             }
           },
       },
@@ -2040,6 +2675,87 @@ bool OmpStructureChecker::CheckIntrinsicOperator(
   return false;
 }
 
+static bool IsReductionAllowedForType(
+    const parser::OmpClause::Reduction &x, const DeclTypeSpec &type) {
+  const auto &definedOp{std::get<parser::OmpReductionOperator>(x.v.t)};
+  // TODO: user defined reduction operators. Just allow everything for now.
+  bool ok{true};
+
+  auto IsLogical{[](const DeclTypeSpec &type) -> bool {
+    return type.category() == DeclTypeSpec::Logical;
+  }};
+  auto IsCharacter{[](const DeclTypeSpec &type) -> bool {
+    return type.category() == DeclTypeSpec::Character;
+  }};
+
+  common::visit(
+      common::visitors{
+          [&](const parser::DefinedOperator &dOpr) {
+            if (const auto *intrinsicOp{
+                    std::get_if<parser::DefinedOperator::IntrinsicOperator>(
+                        &dOpr.u)}) {
+              // OMP5.2: The type [...] of a list item that appears in a
+              // reduction clause must be valid for the combiner expression
+              // See F2023: Table 10.2
+              // .LT., .LE., .GT., .GE. are handled as procedure designators
+              // below.
+              switch (*intrinsicOp) {
+              case parser::DefinedOperator::IntrinsicOperator::Multiply:
+                [[fallthrough]];
+              case parser::DefinedOperator::IntrinsicOperator::Add:
+                [[fallthrough]];
+              case parser::DefinedOperator::IntrinsicOperator::Subtract:
+                ok = type.IsNumeric(TypeCategory::Integer) ||
+                    type.IsNumeric(TypeCategory::Real) ||
+                    type.IsNumeric(TypeCategory::Complex);
+                break;
+
+              case parser::DefinedOperator::IntrinsicOperator::AND:
+                [[fallthrough]];
+              case parser::DefinedOperator::IntrinsicOperator::OR:
+                [[fallthrough]];
+              case parser::DefinedOperator::IntrinsicOperator::EQV:
+                [[fallthrough]];
+              case parser::DefinedOperator::IntrinsicOperator::NEQV:
+                ok = IsLogical(type);
+                break;
+
+              // Reduction identifier is not in OMP5.2 Table 5.2
+              default:
+                DIE("This should have been caught in CheckIntrinsicOperator");
+                ok = false;
+                break;
+              }
+            }
+          },
+          [&](const parser::ProcedureDesignator &procD) {
+            const parser::Name *name{std::get_if<parser::Name>(&procD.u)};
+            if (name && name->symbol) {
+              const SourceName &realName{name->symbol->GetUltimate().name()};
+              // OMP5.2: The type [...] of a list item that appears in a
+              // reduction clause must be valid for the combiner expression
+              if (realName == "iand" || realName == "ior" ||
+                  realName == "ieor") {
+                // IAND: arguments must be integers: F2023 16.9.100
+                // IEOR: arguments must be integers: F2023 16.9.106
+                // IOR: arguments must be integers: F2023 16.9.111
+                ok = type.IsNumeric(TypeCategory::Integer);
+              } else if (realName == "max" || realName == "min") {
+                // MAX: arguments must be integer, real, or character:
+                // F2023 16.9.135
+                // MIN: arguments must be integer, real, or character:
+                // F2023 16.9.141
+                ok = type.IsNumeric(TypeCategory::Integer) ||
+                    type.IsNumeric(TypeCategory::Real) || IsCharacter(type);
+              }
+            }
+          },
+      },
+      definedOp.u);
+
+  return ok;
+}
+
 void OmpStructureChecker::CheckReductionTypeList(
     const parser::OmpClause::Reduction &x) {
   const auto &ompObjectList{std::get<parser::OmpObjectList>(x.v.t)};
@@ -2048,10 +2764,80 @@ void OmpStructureChecker::CheckReductionTypeList(
   CheckReductionArraySection(ompObjectList);
   // If this is a worksharing construct then ensure the reduction variable
   // is not private in the parallel region that it binds to.
-  OmpDirectiveSet workshareSet{llvm::omp::Directive::OMPD_do,
-      llvm::omp::Directive::OMPD_sections, llvm::omp::Directive::OMPD_do_simd};
-  if (workshareSet.test(GetContext().directive)) {
+  if (llvm::omp::nestedReduceWorkshareAllowedSet.test(GetContext().directive)) {
     CheckSharedBindingInOuterContext(ompObjectList);
+  }
+
+  SymbolSourceMap symbols;
+  GetSymbolsInObjectList(ompObjectList, symbols);
+  for (auto &[symbol, source] : symbols) {
+    if (IsProcedurePointer(*symbol)) {
+      context_.Say(source,
+          "A procedure pointer '%s' must not appear in a REDUCTION clause."_err_en_US,
+          symbol->name());
+    } else if (!IsReductionAllowedForType(x, DEREF(symbol->GetType()))) {
+      context_.Say(source,
+          "The type of '%s' is incompatible with the reduction operator."_err_en_US,
+          symbol->name());
+    }
+  }
+}
+
+void OmpStructureChecker::CheckReductionModifier(
+    const parser::OmpClause::Reduction &x) {
+  using ReductionModifier = parser::OmpReductionClause::ReductionModifier;
+  const auto &maybeModifier{std::get<std::optional<ReductionModifier>>(x.v.t)};
+  if (!maybeModifier || *maybeModifier == ReductionModifier::Default) {
+    // No modifier, or the default one is always ok.
+    return;
+  }
+  ReductionModifier modifier{*maybeModifier};
+  const DirectiveContext &dirCtx{GetContext()};
+  if (dirCtx.directive == llvm::omp::Directive::OMPD_loop) {
+    // [5.2:257:33-34]
+    // If a reduction-modifier is specified in a reduction clause that
+    // appears on the directive, then the reduction modifier must be
+    // default.
+    context_.Say(GetContext().clauseSource,
+        "REDUCTION modifier on LOOP directive must be DEFAULT"_err_en_US);
+  }
+  if (modifier == ReductionModifier::Task) {
+    // "Task" is only allowed on worksharing or "parallel" directive.
+    static llvm::omp::Directive worksharing[]{
+        llvm::omp::Directive::OMPD_do, llvm::omp::Directive::OMPD_scope,
+        llvm::omp::Directive::OMPD_sections,
+        // There are more worksharing directives, but they do not apply:
+        // "for" is C++ only,
+        // "single" and "workshare" don't allow reduction clause,
+        // "loop" has different restrictions (checked above).
+    };
+    if (dirCtx.directive != llvm::omp::Directive::OMPD_parallel &&
+        !llvm::is_contained(worksharing, dirCtx.directive)) {
+      context_.Say(GetContext().clauseSource,
+          "Modifier 'TASK' on REDUCTION clause is only allowed with "
+          "PARALLEL or worksharing directive"_err_en_US);
+    }
+  } else if (modifier == ReductionModifier::Inscan) {
+    // "Inscan" is only allowed on worksharing-loop, worksharing-loop simd,
+    // or "simd" directive.
+    // The worksharing-loop directives are OMPD_do and OMPD_for. Only the
+    // former is allowed in Fortran.
+    switch (dirCtx.directive) {
+    case llvm::omp::Directive::OMPD_do: // worksharing-loop
+    case llvm::omp::Directive::OMPD_do_simd: // worksharing-loop simd
+    case llvm::omp::Directive::OMPD_simd: // "simd"
+      break;
+    default:
+      context_.Say(GetContext().clauseSource,
+          "Modifier 'INSCAN' on REDUCTION clause is only allowed with "
+          "worksharing-loop, worksharing-loop simd, "
+          "or SIMD directive"_err_en_US);
+    }
+  } else {
+    // Catch-all for potential future modifiers to make sure that this
+    // function is up-to-date.
+    context_.Say(GetContext().clauseSource,
+        "Unexpected modifier on REDUCTION clause"_err_en_US);
   }
 }
 
@@ -2075,7 +2861,7 @@ void OmpStructureChecker::CheckIntentInPointerAndDefinable(
                   "Variable '%s' on the %s clause is not definable"_err_en_US,
                   symbol->name(),
                   parser::ToUpperCaseLetters(getClauseName(clause).str()))
-              .Attach(std::move(*msg));
+              .Attach(std::move(msg->set_severity(parser::Severity::Because)));
         }
       }
     }
@@ -2141,12 +2927,12 @@ void OmpStructureChecker::CheckSharedBindingInOuterContext(
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Ordered &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_ordered);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_ordered);
   // the parameter of ordered clause is optional
   if (const auto &expr{x.v}) {
     RequiresConstantPositiveParameter(llvm::omp::Clause::OMPC_ordered, *expr);
     // 2.8.3 Loop SIMD Construct Restriction
-    if (llvm::omp::doSimdSet.test(GetContext().directive)) {
+    if (llvm::omp::allDoSimdSet.test(GetContext().directive)) {
       context_.Say(GetContext().clauseSource,
           "No ORDERED clause with a parameter can be specified "
           "on the %s directive"_err_en_US,
@@ -2156,13 +2942,26 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Ordered &x) {
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Shared &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_shared);
-  CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_shared);
+  CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "SHARED");
 }
 void OmpStructureChecker::Enter(const parser::OmpClause::Private &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_private);
-  CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_private);
+  CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "PRIVATE");
   CheckIntentInPointer(x.v, llvm::omp::Clause::OMPC_private);
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::Nowait &x) {
+  CheckAllowedClause(llvm::omp::Clause::OMPC_nowait);
+  if (llvm::omp::noWaitClauseNotAllowedSet.test(GetContext().directive)) {
+    context_.Say(GetContext().clauseSource,
+        "%s clause is not allowed on the OMP %s directive,"
+        " use it on OMP END %s directive "_err_en_US,
+        parser::ToUpperCaseLetters(
+            getClauseName(llvm::omp::Clause::OMPC_nowait).str()),
+        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()),
+        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()));
+  }
 }
 
 bool OmpStructureChecker::IsDataRefTypeParamInquiry(
@@ -2186,10 +2985,8 @@ bool OmpStructureChecker::IsDataRefTypeParamInquiry(
 }
 
 void OmpStructureChecker::CheckIsVarPartOfAnotherVar(
-    const parser::CharBlock &source, const parser::OmpObjectList &objList) {
-  OmpDirectiveSet nonPartialVarSet{llvm::omp::Directive::OMPD_allocate,
-      llvm::omp::Directive::OMPD_threadprivate,
-      llvm::omp::Directive::OMPD_declare_target};
+    const parser::CharBlock &source, const parser::OmpObjectList &objList,
+    llvm::StringRef clause) {
   for (const auto &ompObject : objList.v) {
     common::visit(
         common::visitors{
@@ -2204,7 +3001,8 @@ void OmpStructureChecker::CheckIsVarPartOfAnotherVar(
                 } else if (parser::Unwrap<parser::StructureComponent>(
                                ompObject) ||
                     parser::Unwrap<parser::ArrayElement>(ompObject)) {
-                  if (nonPartialVarSet.test(GetContext().directive)) {
+                  if (llvm::omp::nonPartialVarSet.test(
+                          GetContext().directive)) {
                     context_.Say(source,
                         "A variable that is part of another variable (as an "
                         "array or structure element) cannot appear on the %s "
@@ -2214,7 +3012,8 @@ void OmpStructureChecker::CheckIsVarPartOfAnotherVar(
                     context_.Say(source,
                         "A variable that is part of another variable (as an "
                         "array or structure element) cannot appear in a "
-                        "PRIVATE or SHARED clause"_err_en_US);
+                        "%s clause"_err_en_US,
+                        clause.data());
                   }
                 }
               }
@@ -2226,7 +3025,9 @@ void OmpStructureChecker::CheckIsVarPartOfAnotherVar(
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Firstprivate &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_firstprivate);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_firstprivate);
+
+  CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "FIRSTPRIVATE");
   CheckIsLoopIvPartOfClause(llvmOmpClause::OMPC_firstprivate, x.v);
 
   SymbolSourceMap currSymbols;
@@ -2277,7 +3078,7 @@ void OmpStructureChecker::CheckIsLoopIvPartOfClause(
     }
   }
 }
-// Following clauses have a seperate node in parse-tree.h.
+// Following clauses have a separate node in parse-tree.h.
 // Atomic-clause
 CHECK_SIMPLE_PARSER_CLAUSE(OmpAtomicRead, OMPC_read)
 CHECK_SIMPLE_PARSER_CLAUSE(OmpAtomicWrite, OMPC_write)
@@ -2311,7 +3112,7 @@ void OmpStructureChecker::Leave(const parser::OmpAtomic &) {
 // Restrictions specific to each clause are implemented apart from the
 // generalized restrictions.
 void OmpStructureChecker::Enter(const parser::OmpClause::Aligned &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_aligned);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_aligned);
 
   if (const auto &expr{
           std::get<std::optional<parser::ScalarIntConstantExpr>>(x.v.t)}) {
@@ -2320,7 +3121,7 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Aligned &x) {
   // 2.8.1 TODO: list-item attribute check
 }
 void OmpStructureChecker::Enter(const parser::OmpClause::Defaultmap &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_defaultmap);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_defaultmap);
   using VariableCategory = parser::OmpDefaultmapClause::VariableCategory;
   if (!std::get<std::optional<VariableCategory>>(x.v.t)) {
     context_.Say(GetContext().clauseSource,
@@ -2329,21 +3130,25 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Defaultmap &x) {
   }
 }
 void OmpStructureChecker::Enter(const parser::OmpClause::If &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_if);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_if);
   using dirNameModifier = parser::OmpIfClause::DirectiveNameModifier;
+  // TODO Check that, when multiple 'if' clauses are applied to a combined
+  // construct, at most one of them applies to each directive.
   static std::unordered_map<dirNameModifier, OmpDirectiveSet>
-      dirNameModifierMap{{dirNameModifier::Parallel, llvm::omp::parallelSet},
-          {dirNameModifier::Target, llvm::omp::targetSet},
+      dirNameModifierMap{{dirNameModifier::Parallel, llvm::omp::allParallelSet},
+          {dirNameModifier::Simd, llvm::omp::allSimdSet},
+          {dirNameModifier::Target, llvm::omp::allTargetSet},
+          {dirNameModifier::TargetData,
+              {llvm::omp::Directive::OMPD_target_data}},
           {dirNameModifier::TargetEnterData,
               {llvm::omp::Directive::OMPD_target_enter_data}},
           {dirNameModifier::TargetExitData,
               {llvm::omp::Directive::OMPD_target_exit_data}},
-          {dirNameModifier::TargetData,
-              {llvm::omp::Directive::OMPD_target_data}},
           {dirNameModifier::TargetUpdate,
               {llvm::omp::Directive::OMPD_target_update}},
           {dirNameModifier::Task, {llvm::omp::Directive::OMPD_task}},
-          {dirNameModifier::Taskloop, llvm::omp::taskloopSet}};
+          {dirNameModifier::Taskloop, llvm::omp::allTaskloopSet},
+          {dirNameModifier::Teams, llvm::omp::allTeamsSet}};
   if (const auto &directiveName{
           std::get<std::optional<dirNameModifier>>(x.v.t)}) {
     auto search{dirNameModifierMap.find(*directiveName)};
@@ -2361,10 +3166,11 @@ void OmpStructureChecker::Enter(const parser::OmpClause::If &x) {
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Linear &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_linear);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_linear);
 
   // 2.7 Loop Construct Restriction
-  if ((llvm::omp::doSet | llvm::omp::simdSet).test(GetContext().directive)) {
+  if ((llvm::omp::allDoSet | llvm::omp::allSimdSet)
+          .test(GetContext().directive)) {
     if (std::holds_alternative<parser::OmpLinearClause::WithModifier>(x.v.u)) {
       context_.Say(GetContext().clauseSource,
           "A modifier may not be specified in a LINEAR clause "
@@ -2375,30 +3181,60 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Linear &x) {
 }
 
 void OmpStructureChecker::CheckAllowedMapTypes(
-    const parser::OmpMapType::Type &type,
-    const std::list<parser::OmpMapType::Type> &allowedMapTypeList) {
+    const parser::OmpMapClause::Type &type,
+    const std::list<parser::OmpMapClause::Type> &allowedMapTypeList) {
   if (!llvm::is_contained(allowedMapTypeList, type)) {
-    std::string commaSeperatedMapTypes;
+    std::string commaSeparatedMapTypes;
     llvm::interleave(
         allowedMapTypeList.begin(), allowedMapTypeList.end(),
-        [&](const parser::OmpMapType::Type &mapType) {
-          commaSeperatedMapTypes.append(parser::ToUpperCaseLetters(
-              parser::OmpMapType::EnumToString(mapType)));
+        [&](const parser::OmpMapClause::Type &mapType) {
+          commaSeparatedMapTypes.append(parser::ToUpperCaseLetters(
+              parser::OmpMapClause::EnumToString(mapType)));
         },
-        [&] { commaSeperatedMapTypes.append(", "); });
+        [&] { commaSeparatedMapTypes.append(", "); });
     context_.Say(GetContext().clauseSource,
         "Only the %s map types are permitted "
         "for MAP clauses on the %s directive"_err_en_US,
-        commaSeperatedMapTypes, ContextDirectiveAsFortran());
+        commaSeparatedMapTypes, ContextDirectiveAsFortran());
   }
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Map &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_map);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_map);
+  using TypeMod = parser::OmpMapClause::TypeModifier;
+  using Type = parser::OmpMapClause::Type;
+  using IterMod = parser::OmpIteratorModifier;
 
-  if (const auto &maptype{std::get<std::optional<parser::OmpMapType>>(x.v.t)}) {
-    using Type = parser::OmpMapType::Type;
-    const Type &type{std::get<Type>(maptype->t)};
+  unsigned version{context_.langOptions().OpenMPVersion};
+  if (auto commas{std::get<bool>(x.v.t)}; !commas && version >= 52) {
+    context_.Say(GetContext().clauseSource,
+        "The specification of modifiers without comma separators for the "
+        "'MAP' clause has been deprecated in OpenMP 5.2"_port_en_US);
+  }
+  if (auto &mapTypeMod{std::get<std::optional<std::list<TypeMod>>>(x.v.t)}) {
+    if (auto *dup{FindDuplicateEntry(*mapTypeMod)}) {
+      context_.Say(GetContext().clauseSource,
+          "Duplicate map-type-modifier entry '%s' will be ignored"_warn_en_US,
+          parser::ToUpperCaseLetters(parser::OmpMapClause::EnumToString(*dup)));
+    }
+  }
+  // The size of any of the optional lists is never 0, instead of the list
+  // being empty, it will be a nullopt.
+  if (auto &iterMod{std::get<std::optional<std::list<IterMod>>>(x.v.t)}) {
+    if (iterMod->size() != 1) {
+      context_.Say(GetContext().clauseSource,
+          "Only one iterator-modifier is allowed"_err_en_US);
+    }
+    CheckIteratorModifier(iterMod->front());
+  }
+  if (auto &mapType{std::get<std::optional<std::list<Type>>>(x.v.t)}) {
+    if (mapType->size() != 1) {
+      context_.Say(GetContext().clauseSource,
+          "Multiple map types are not allowed"_err_en_US);
+      return;
+    }
+    parser::OmpMapClause::Type type{mapType->front()};
+
     switch (GetContext().directive) {
     case llvm::omp::Directive::OMPD_target:
     case llvm::omp::Directive::OMPD_target_teams:
@@ -2440,11 +3276,11 @@ bool OmpStructureChecker::ScheduleModifierHasType(
   return false;
 }
 void OmpStructureChecker::Enter(const parser::OmpClause::Schedule &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_schedule);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_schedule);
   const parser::OmpScheduleClause &scheduleClause = x.v;
 
   // 2.7 Loop Construct Restriction
-  if (llvm::omp::doSet.test(GetContext().directive)) {
+  if (llvm::omp::allDoSet.test(GetContext().directive)) {
     const auto &kind{std::get<1>(scheduleClause.t)};
     const auto &chunk{std::get<2>(scheduleClause.t)};
     if (chunk) {
@@ -2476,25 +3312,112 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Schedule &x) {
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Device &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_device);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_device);
   const parser::OmpDeviceClause &deviceClause = x.v;
   const auto &device{std::get<1>(deviceClause.t)};
   RequiresPositiveParameter(
       llvm::omp::Clause::OMPC_device, device, "device expression");
+  std::optional<parser::OmpDeviceClause::DeviceModifier> modifier =
+      std::get<0>(deviceClause.t);
+  if (modifier &&
+      *modifier == parser::OmpDeviceClause::DeviceModifier::Ancestor) {
+    if (GetContext().directive != llvm::omp::OMPD_target) {
+      context_.Say(GetContext().clauseSource,
+          "The ANCESTOR device-modifier must not appear on the DEVICE clause on"
+          " any directive other than the TARGET construct. Found on %s construct."_err_en_US,
+          parser::ToUpperCaseLetters(getDirectiveName(GetContext().directive)));
+    }
+  }
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Depend &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_depend);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_depend);
+  llvm::omp::Directive directive{GetContext().directive};
+  unsigned version{context_.langOptions().OpenMPVersion};
+
+  using DepType = parser::OmpTaskDependenceType::Type;
+  DepType depType = x.v.GetDepType();
+
+  if (version >= 52) {
+    switch (depType) {
+    case DepType::Sink:
+    case DepType::Source:
+      context_.Say(GetContext().clauseSource,
+          "The %s task-dependence-type is deprecated in %s"_warn_en_US,
+          parser::ToUpperCaseLetters(
+              parser::OmpTaskDependenceType::EnumToString(depType)),
+          ThisVersion(version));
+      break;
+    default:
+      break;
+    }
+  }
+
+  if (directive == llvm::omp::OMPD_depobj) {
+    // [5.0:255:11], [5.1:288:3]
+    // A depend clause on a depobj construct must not have source, sink [or
+    // depobj](5.0) as dependence-type.
+    if (version >= 50) {
+      bool invalidDep{depType == DepType::Source || depType == DepType::Sink};
+      if (version == 50) {
+        invalidDep = invalidDep || depType == DepType::Depobj;
+      }
+      if (invalidDep) {
+        context_.Say(GetContext().clauseSource,
+            "A DEPEND clause on a DEPOBJ construct must not have SOURCE%s "
+            "as dependence-type"_err_en_US,
+            version == 50 ? ", SINK or DEPOBJ" : " or SINK");
+      }
+    }
+  } else if (directive != llvm::omp::OMPD_ordered) {
+    if (depType == DepType::Source || depType == DepType::Sink) {
+      context_.Say(GetContext().clauseSource,
+          "DEPEND(SOURCE) or DEPEND(SINK : vec) can be used only with the "
+          "ordered directive. Used here in the %s construct."_err_en_US,
+          parser::ToUpperCaseLetters(getDirectiveName(directive)));
+    }
+  }
   if (const auto *inOut{std::get_if<parser::OmpDependClause::InOut>(&x.v.u)}) {
-    const auto &designators{std::get<std::list<parser::Designator>>(inOut->t)};
-    for (const auto &ele : designators) {
-      if (const auto *dataRef{std::get_if<parser::DataRef>(&ele.u)}) {
-        CheckDependList(*dataRef);
-        if (const auto *arr{
-                std::get_if<common::Indirection<parser::ArrayElement>>(
-                    &dataRef->u)}) {
-          CheckArraySection(arr->value(), GetLastName(*dataRef),
-              llvm::omp::Clause::OMPC_depend);
+    auto &objList{std::get<parser::OmpObjectList>(inOut->t)};
+    if (directive == llvm::omp::OMPD_depobj) {
+      // [5.0:255:13], [5.1:288:6], [5.2:322:26]
+      // A depend clause on a depobj construct must only specify one locator.
+      if (objList.v.size() != 1) {
+        context_.Say(GetContext().clauseSource,
+            "A DEPEND clause on a DEPOBJ construct must only specify "
+            "one locator"_err_en_US);
+      }
+    }
+    for (const auto &object : objList.v) {
+      if (const auto *name{std::get_if<parser::Name>(&object.u)}) {
+        context_.Say(GetContext().clauseSource,
+            "Common block name ('%s') cannot appear in a DEPEND "
+            "clause"_err_en_US,
+            name->ToString());
+      } else if (auto *designator{std::get_if<parser::Designator>(&object.u)}) {
+        if (auto *dataRef{std::get_if<parser::DataRef>(&designator->u)}) {
+          CheckDependList(*dataRef);
+          if (const auto *arr{
+                  std::get_if<common::Indirection<parser::ArrayElement>>(
+                      &dataRef->u)}) {
+            CheckArraySection(arr->value(), GetLastName(*dataRef),
+                llvm::omp::Clause::OMPC_depend);
+          }
+        }
+      }
+    }
+    if (std::get<std::optional<parser::OmpIteratorModifier>>(inOut->t)) {
+      unsigned allowedInVersion{50};
+      if (version < allowedInVersion) {
+        context_.Say(GetContext().clauseSource,
+            "Iterator modifiers are not supported in %s, %s"_warn_en_US,
+            ThisVersion(version), TryVersion(allowedInVersion));
+      } else {
+        if (directive == llvm::omp::OMPD_depobj) {
+          context_.Say(GetContext().clauseSource,
+              "An iterator-modifier may specify multiple locators, "
+              "a DEPEND clause on a DEPOBJ construct must only specify "
+              "one locator"_warn_en_US);
         }
       }
     }
@@ -2503,35 +3426,49 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Depend &x) {
 
 void OmpStructureChecker::CheckCopyingPolymorphicAllocatable(
     SymbolSourceMap &symbols, const llvm::omp::Clause clause) {
-  for (auto it{symbols.begin()}; it != symbols.end(); ++it) {
-    const auto *symbol{it->first};
-    const auto source{it->second};
-    if (IsPolymorphicAllocatable(*symbol)) {
-      context_.Say(source,
-          "If a polymorphic variable with allocatable attribute '%s' is in "
-          "%s clause, the behavior is unspecified"_port_en_US,
-          symbol->name(),
-          parser::ToUpperCaseLetters(getClauseName(clause).str()));
+  if (context_.ShouldWarn(common::UsageWarning::Portability)) {
+    for (auto it{symbols.begin()}; it != symbols.end(); ++it) {
+      const auto *symbol{it->first};
+      const auto source{it->second};
+      if (IsPolymorphicAllocatable(*symbol)) {
+        context_.Warn(common::UsageWarning::Portability, source,
+            "If a polymorphic variable with allocatable attribute '%s' is in %s clause, the behavior is unspecified"_port_en_US,
+            symbol->name(),
+            parser::ToUpperCaseLetters(getClauseName(clause).str()));
+      }
     }
   }
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Copyprivate &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_copyprivate);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_copyprivate);
   CheckIntentInPointer(x.v, llvm::omp::Clause::OMPC_copyprivate);
   SymbolSourceMap currSymbols;
   GetSymbolsInObjectList(x.v, currSymbols);
   CheckCopyingPolymorphicAllocatable(
       currSymbols, llvm::omp::Clause::OMPC_copyprivate);
+  if (GetContext().directive == llvm::omp::Directive::OMPD_single) {
+    context_.Say(GetContext().clauseSource,
+        "%s clause is not allowed on the OMP %s directive,"
+        " use it on OMP END %s directive "_err_en_US,
+        parser::ToUpperCaseLetters(
+            getClauseName(llvm::omp::Clause::OMPC_copyprivate).str()),
+        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()),
+        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()));
+  }
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Lastprivate &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_lastprivate);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_lastprivate);
+
+  const auto &objectList{std::get<parser::OmpObjectList>(x.v.t)};
+  CheckIsVarPartOfAnotherVar(
+      GetContext().clauseSource, objectList, "LASTPRIVATE");
 
   DirectivesClauseTriple dirClauseTriple;
   SymbolSourceMap currSymbols;
-  GetSymbolsInObjectList(x.v, currSymbols);
-  CheckDefinableObjects(currSymbols, GetClauseKindForParserClass(x));
+  GetSymbolsInObjectList(objectList, currSymbols);
+  CheckDefinableObjects(currSymbols, llvm::omp::Clause::OMPC_lastprivate);
   CheckCopyingPolymorphicAllocatable(
       currSymbols, llvm::omp::Clause::OMPC_lastprivate);
 
@@ -2544,16 +3481,240 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Lastprivate &x) {
           llvm::omp::Directive::OMPD_parallel, llvm::omp::privateReductionSet));
 
   CheckPrivateSymbolsInOuterCxt(
-      currSymbols, dirClauseTriple, GetClauseKindForParserClass(x));
+      currSymbols, dirClauseTriple, llvm::omp::Clause::OMPC_lastprivate);
+
+  using LastprivateModifier = parser::OmpLastprivateClause::LastprivateModifier;
+  const auto &maybeMod{std::get<std::optional<LastprivateModifier>>(x.v.t)};
+  if (maybeMod) {
+    unsigned version{context_.langOptions().OpenMPVersion};
+    unsigned allowedInVersion = 50;
+    if (version < allowedInVersion) {
+      std::string thisVersion{
+          std::to_string(version / 10) + "." + std::to_string(version % 10)};
+      context_.Say(GetContext().clauseSource,
+          "LASTPRIVATE clause with CONDITIONAL modifier is not "
+          "allowed in %s, %s"_err_en_US,
+          ThisVersion(version), TryVersion(allowedInVersion));
+    }
+  }
 }
 
 void OmpStructureChecker::Enter(const parser::OmpClause::Copyin &x) {
-  CheckAllowed(llvm::omp::Clause::OMPC_copyin);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_copyin);
 
   SymbolSourceMap currSymbols;
   GetSymbolsInObjectList(x.v, currSymbols);
   CheckCopyingPolymorphicAllocatable(
       currSymbols, llvm::omp::Clause::OMPC_copyin);
+}
+
+void OmpStructureChecker::CheckStructureElement(
+    const parser::OmpObjectList &ompObjectList,
+    const llvm::omp::Clause clause) {
+  for (const auto &ompObject : ompObjectList.v) {
+    common::visit(
+        common::visitors{
+            [&](const parser::Designator &designator) {
+              if (std::get_if<parser::DataRef>(&designator.u)) {
+                if (parser::Unwrap<parser::StructureComponent>(ompObject)) {
+                  context_.Say(GetContext().clauseSource,
+                      "A variable that is part of another variable "
+                      "(structure element) cannot appear on the %s "
+                      "%s clause"_err_en_US,
+                      ContextDirectiveAsFortran(),
+                      parser::ToUpperCaseLetters(getClauseName(clause).str()));
+                }
+              }
+            },
+            [&](const parser::Name &name) {},
+        },
+        ompObject.u);
+  }
+  return;
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::Update &x) {
+  CheckAllowedClause(llvm::omp::Clause::OMPC_update);
+  llvm::omp::Directive directive{GetContext().directive};
+  unsigned version{context_.langOptions().OpenMPVersion};
+
+  // [5.1:288:4-5]
+  // An update clause on a depobj construct must not have source, sink or depobj
+  // as dependence-type.
+  // [5.2:322:3]
+  // task-dependence-type must not be depobj.
+  if (directive == llvm::omp::OMPD_depobj) {
+    if (version >= 51) {
+      // Update -> OmpUpdateClause -> OmpTaskDependenceType -> Type
+      switch (x.v.v.v) {
+      case parser::OmpTaskDependenceType::Type::Source:
+      case parser::OmpTaskDependenceType::Type::Sink:
+      case parser::OmpTaskDependenceType::Type::Depobj:
+        context_.Say(GetContext().clauseSource,
+            "An UPDATE clause on a DEPOBJ construct must not have SOURCE, "
+            "SINK or DEPOBJ as dependence-type"_err_en_US);
+        break;
+      default:
+        break;
+      }
+    }
+  }
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::UseDevicePtr &x) {
+  CheckStructureElement(x.v, llvm::omp::Clause::OMPC_use_device_ptr);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_use_device_ptr);
+  SymbolSourceMap currSymbols;
+  GetSymbolsInObjectList(x.v, currSymbols);
+  semantics::UnorderedSymbolSet listVars;
+  auto useDevicePtrClauses{FindClauses(llvm::omp::Clause::OMPC_use_device_ptr)};
+  for (auto itr = useDevicePtrClauses.first; itr != useDevicePtrClauses.second;
+       ++itr) {
+    const auto &useDevicePtrClause{
+        std::get<parser::OmpClause::UseDevicePtr>(itr->second->u)};
+    const auto &useDevicePtrList{useDevicePtrClause.v};
+    std::list<parser::Name> useDevicePtrNameList;
+    for (const auto &ompObject : useDevicePtrList.v) {
+      if (const auto *name{parser::Unwrap<parser::Name>(ompObject)}) {
+        if (name->symbol) {
+          if (!(IsBuiltinCPtr(*(name->symbol)))) {
+            context_.Warn(common::UsageWarning::OpenMPUsage,
+                itr->second->source,
+                "Use of non-C_PTR type '%s' in USE_DEVICE_PTR is deprecated, use USE_DEVICE_ADDR instead"_warn_en_US,
+                name->ToString());
+          } else {
+            useDevicePtrNameList.push_back(*name);
+          }
+        }
+      }
+    }
+    CheckMultipleOccurrence(
+        listVars, useDevicePtrNameList, itr->second->source, "USE_DEVICE_PTR");
+  }
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::UseDeviceAddr &x) {
+  CheckStructureElement(x.v, llvm::omp::Clause::OMPC_use_device_addr);
+  CheckAllowedClause(llvm::omp::Clause::OMPC_use_device_addr);
+  SymbolSourceMap currSymbols;
+  GetSymbolsInObjectList(x.v, currSymbols);
+  semantics::UnorderedSymbolSet listVars;
+  auto useDeviceAddrClauses{
+      FindClauses(llvm::omp::Clause::OMPC_use_device_addr)};
+  for (auto itr = useDeviceAddrClauses.first;
+       itr != useDeviceAddrClauses.second; ++itr) {
+    const auto &useDeviceAddrClause{
+        std::get<parser::OmpClause::UseDeviceAddr>(itr->second->u)};
+    const auto &useDeviceAddrList{useDeviceAddrClause.v};
+    std::list<parser::Name> useDeviceAddrNameList;
+    for (const auto &ompObject : useDeviceAddrList.v) {
+      if (const auto *name{parser::Unwrap<parser::Name>(ompObject)}) {
+        if (name->symbol) {
+          useDeviceAddrNameList.push_back(*name);
+        }
+      }
+    }
+    CheckMultipleOccurrence(listVars, useDeviceAddrNameList,
+        itr->second->source, "USE_DEVICE_ADDR");
+  }
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::IsDevicePtr &x) {
+  CheckAllowedClause(llvm::omp::Clause::OMPC_is_device_ptr);
+  SymbolSourceMap currSymbols;
+  GetSymbolsInObjectList(x.v, currSymbols);
+  semantics::UnorderedSymbolSet listVars;
+  auto isDevicePtrClauses{FindClauses(llvm::omp::Clause::OMPC_is_device_ptr)};
+  for (auto itr = isDevicePtrClauses.first; itr != isDevicePtrClauses.second;
+       ++itr) {
+    const auto &isDevicePtrClause{
+        std::get<parser::OmpClause::IsDevicePtr>(itr->second->u)};
+    const auto &isDevicePtrList{isDevicePtrClause.v};
+    SymbolSourceMap currSymbols;
+    GetSymbolsInObjectList(isDevicePtrList, currSymbols);
+    for (auto &[symbol, source] : currSymbols) {
+      if (!(IsBuiltinCPtr(*symbol))) {
+        context_.Say(itr->second->source,
+            "Variable '%s' in IS_DEVICE_PTR clause must be of type C_PTR"_err_en_US,
+            source.ToString());
+      } else if (!(IsDummy(*symbol))) {
+        context_.Warn(common::UsageWarning::OpenMPUsage, itr->second->source,
+            "Variable '%s' in IS_DEVICE_PTR clause must be a dummy argument. "
+            "This semantic check is deprecated from OpenMP 5.2 and later."_warn_en_US,
+            source.ToString());
+      } else if (IsAllocatableOrPointer(*symbol) || IsValue(*symbol)) {
+        context_.Warn(common::UsageWarning::OpenMPUsage, itr->second->source,
+            "Variable '%s' in IS_DEVICE_PTR clause must be a dummy argument "
+            "that does not have the ALLOCATABLE, POINTER or VALUE attribute. "
+            "This semantic check is deprecated from OpenMP 5.2 and later."_warn_en_US,
+            source.ToString());
+      }
+    }
+  }
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::HasDeviceAddr &x) {
+  CheckAllowedClause(llvm::omp::Clause::OMPC_has_device_addr);
+  SymbolSourceMap currSymbols;
+  GetSymbolsInObjectList(x.v, currSymbols);
+  semantics::UnorderedSymbolSet listVars;
+  auto hasDeviceAddrClauses{
+      FindClauses(llvm::omp::Clause::OMPC_has_device_addr)};
+  for (auto itr = hasDeviceAddrClauses.first;
+       itr != hasDeviceAddrClauses.second; ++itr) {
+    const auto &hasDeviceAddrClause{
+        std::get<parser::OmpClause::HasDeviceAddr>(itr->second->u)};
+    const auto &hasDeviceAddrList{hasDeviceAddrClause.v};
+    std::list<parser::Name> hasDeviceAddrNameList;
+    for (const auto &ompObject : hasDeviceAddrList.v) {
+      if (const auto *name{parser::Unwrap<parser::Name>(ompObject)}) {
+        if (name->symbol) {
+          hasDeviceAddrNameList.push_back(*name);
+        }
+      }
+    }
+  }
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::Enter &x) {
+  CheckAllowedClause(llvm::omp::Clause::OMPC_enter);
+  const parser::OmpObjectList &objList{x.v};
+  SymbolSourceMap symbols;
+  GetSymbolsInObjectList(objList, symbols);
+  for (const auto &[sym, source] : symbols) {
+    if (!IsExtendedListItem(*sym)) {
+      context_.SayWithDecl(*sym, source,
+          "'%s' must be a variable or a procedure"_err_en_US, sym->name());
+    }
+  }
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::To &x) {
+  CheckAllowedClause(llvm::omp::Clause::OMPC_to);
+  if (dirContext_.empty()) {
+    return;
+  }
+  // The "to" clause is only allowed on "declare target" (pre-5.1), and
+  // "target update". In the former case it can take an extended list item,
+  // in the latter a variable (a locator).
+
+  // The "declare target" construct (and the "to" clause on it) are already
+  // handled (in the declare-target checkers), so just look at "to" in "target
+  // update".
+  if (GetContext().directive == llvm::omp::OMPD_declare_target) {
+    return;
+  }
+  assert(GetContext().directive == llvm::omp::OMPD_target_update);
+
+  const parser::OmpObjectList &objList{x.v};
+  SymbolSourceMap symbols;
+  GetSymbolsInObjectList(objList, symbols);
+  for (const auto &[sym, source] : symbols) {
+    if (!IsVariableListItem(*sym)) {
+      context_.SayWithDecl(
+          *sym, source, "'%s' must be a variable"_err_en_US, sym->name());
+    }
+  }
 }
 
 llvm::StringRef OmpStructureChecker::getClauseName(llvm::omp::Clause clause) {
@@ -2583,7 +3744,7 @@ void OmpStructureChecker::CheckDependList(const parser::DataRef &d) {
             context_.Say(GetContext().clauseSource,
                 "Coarrays are not supported in DEPEND clause"_err_en_US);
           },
-          [&](const parser::Name &) { return; },
+          [&](const parser::Name &) {},
       },
       d.u);
 }
@@ -2683,7 +3844,7 @@ void OmpStructureChecker::CheckDefinableObjects(
               "Variable '%s' on the %s clause is not definable"_err_en_US,
               symbol->name(),
               parser::ToUpperCaseLetters(getClauseName(clause).str()))
-          .Attach(std::move(*msg));
+          .Attach(std::move(msg->set_severity(parser::Severity::Because)));
     }
   }
 }
@@ -2779,13 +3940,6 @@ void OmpStructureChecker::CheckWorkshareBlockStmts(
         // Check if OpenMP constructs enclosed in the Workshare construct are
         // 'Parallel' constructs
         auto currentDir{llvm::omp::Directive::OMPD_unknown};
-        const OmpDirectiveSet parallelDirSet{
-            llvm::omp::Directive::OMPD_parallel,
-            llvm::omp::Directive::OMPD_parallel_do,
-            llvm::omp::Directive::OMPD_parallel_sections,
-            llvm::omp::Directive::OMPD_parallel_workshare,
-            llvm::omp::Directive::OMPD_parallel_do_simd};
-
         if (const auto *ompBlockConstruct{
                 std::get_if<parser::OpenMPBlockConstruct>(&ompConstruct->u)}) {
           const auto &beginBlockDir{
@@ -2812,7 +3966,7 @@ void OmpStructureChecker::CheckWorkshareBlockStmts(
           currentDir = beginDir.v;
         }
 
-        if (!parallelDirSet.test(currentDir)) {
+        if (!llvm::omp::topParallelSet.test(currentDir)) {
           context_.Say(source,
               "OpenMP constructs enclosed in WORKSHARE construct may consist "
               "of ATOMIC, CRITICAL or PARALLEL constructs only"_err_en_US);
@@ -2833,15 +3987,15 @@ const parser::OmpObjectList *OmpStructureChecker::GetOmpObjectList(
   // Clauses with OmpObjectList as its data member
   using MemberObjectListClauses = std::tuple<parser::OmpClause::Copyprivate,
       parser::OmpClause::Copyin, parser::OmpClause::Firstprivate,
-      parser::OmpClause::From, parser::OmpClause::Lastprivate,
-      parser::OmpClause::Link, parser::OmpClause::Private,
-      parser::OmpClause::Shared, parser::OmpClause::To,
+      parser::OmpClause::From, parser::OmpClause::Link,
+      parser::OmpClause::Private, parser::OmpClause::Shared,
+      parser::OmpClause::To, parser::OmpClause::Enter,
       parser::OmpClause::UseDevicePtr, parser::OmpClause::UseDeviceAddr>;
 
   // Clauses with OmpObjectList in the tuple
-  using TupleObjectListClauses =
-      std::tuple<parser::OmpClause::Allocate, parser::OmpClause::Map,
-          parser::OmpClause::Reduction, parser::OmpClause::Aligned>;
+  using TupleObjectListClauses = std::tuple<parser::OmpClause::Allocate,
+      parser::OmpClause::Lastprivate, parser::OmpClause::Map,
+      parser::OmpClause::Reduction, parser::OmpClause::Aligned>;
 
   // TODO:: Generate the tuples using TableGen.
   // Handle other constructs with OmpObjectList such as OpenMPThreadprivate.
@@ -2860,6 +4014,42 @@ const parser::OmpObjectList *OmpStructureChecker::GetOmpObjectList(
           },
       },
       clause.u);
+}
+
+void OmpStructureChecker::Enter(
+    const parser::OmpClause::AtomicDefaultMemOrder &x) {
+  CheckAllowedRequiresClause(llvm::omp::Clause::OMPC_atomic_default_mem_order);
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::DynamicAllocators &x) {
+  CheckAllowedRequiresClause(llvm::omp::Clause::OMPC_dynamic_allocators);
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::ReverseOffload &x) {
+  CheckAllowedRequiresClause(llvm::omp::Clause::OMPC_reverse_offload);
+}
+
+void OmpStructureChecker::Enter(const parser::OmpClause::UnifiedAddress &x) {
+  CheckAllowedRequiresClause(llvm::omp::Clause::OMPC_unified_address);
+}
+
+void OmpStructureChecker::Enter(
+    const parser::OmpClause::UnifiedSharedMemory &x) {
+  CheckAllowedRequiresClause(llvm::omp::Clause::OMPC_unified_shared_memory);
+}
+
+void OmpStructureChecker::CheckAllowedRequiresClause(llvmOmpClause clause) {
+  CheckAllowedClause(clause);
+
+  if (clause != llvm::omp::Clause::OMPC_atomic_default_mem_order) {
+    // Check that it does not appear after a device construct
+    if (deviceConstructFound_) {
+      context_.Say(GetContext().clauseSource,
+          "REQUIRES directive with '%s' clause found lexically after device "
+          "construct"_err_en_US,
+          parser::ToUpperCaseLetters(getClauseName(clause).str()));
+    }
+  }
 }
 
 } // namespace Fortran::semantics

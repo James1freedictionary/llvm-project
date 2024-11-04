@@ -92,6 +92,11 @@ LLVMContext::LLVMContext() : pImpl(new LLVMContextImpl(*this)) {
          "kcfi operand bundle id drifted!");
   (void)KCFIEntry;
 
+  auto *ConvergenceCtrlEntry = pImpl->getOrInsertBundleTag("convergencectrl");
+  assert(ConvergenceCtrlEntry->second == LLVMContext::OB_convergencectrl &&
+         "convergencectrl operand bundle id drifted!");
+  (void)ConvergenceCtrlEntry;
+
   SyncScope::ID SingleThreadSSID =
       pImpl->getOrInsertSyncScopeID("singlethread");
   assert(SingleThreadSSID == SyncScope::SingleThread &&
@@ -113,6 +118,13 @@ void LLVMContext::addModule(Module *M) {
 
 void LLVMContext::removeModule(Module *M) {
   pImpl->OwnedModules.erase(M);
+  pImpl->MachineFunctionNums.erase(M);
+}
+
+unsigned LLVMContext::generateMachineFunctionNum(Function &F) {
+  Module *M = F.getParent();
+  assert(pImpl->OwnedModules.contains(M) && "Unexpected module!");
+  return pImpl->MachineFunctionNums[M]++;
 }
 
 //===----------------------------------------------------------------------===//
@@ -251,10 +263,13 @@ void LLVMContext::diagnose(const DiagnosticInfo &DI) {
       RS->emit(*OptDiagBase);
 
   // If there is a report handler, use it.
-  if (pImpl->DiagHandler &&
-      (!pImpl->RespectDiagnosticFilters || isDiagnosticEnabled(DI)) &&
-      pImpl->DiagHandler->handleDiagnostics(DI))
-    return;
+  if (pImpl->DiagHandler) {
+    if (DI.getSeverity() == DS_Error)
+      pImpl->DiagHandler->HasErrors = true;
+    if ((!pImpl->RespectDiagnosticFilters || isDiagnosticEnabled(DI)) &&
+        pImpl->DiagHandler->handleDiagnostics(DI))
+      return;
+  }
 
   if (!isDiagnosticEnabled(DI))
     return;
@@ -315,14 +330,12 @@ void LLVMContext::getSyncScopeNames(SmallVectorImpl<StringRef> &SSNs) const {
   pImpl->getSyncScopeNames(SSNs);
 }
 
-void LLVMContext::setGC(const Function &Fn, std::string GCName) {
-  auto It = pImpl->GCNames.find(&Fn);
+std::optional<StringRef> LLVMContext::getSyncScopeName(SyncScope::ID Id) const {
+  return pImpl->getSyncScopeName(Id);
+}
 
-  if (It == pImpl->GCNames.end()) {
-    pImpl->GCNames.insert(std::make_pair(&Fn, std::move(GCName)));
-    return;
-  }
-  It->second = std::move(GCName);
+void LLVMContext::setGC(const Function &Fn, std::string GCName) {
+  pImpl->GCNames[&Fn] = std::move(GCName);
 }
 
 const std::string &LLVMContext::getGC(const Function &Fn) {
@@ -368,10 +381,18 @@ std::unique_ptr<DiagnosticHandler> LLVMContext::getDiagnosticHandler() {
   return std::move(pImpl->DiagHandler);
 }
 
-void LLVMContext::setOpaquePointers(bool Enable) const {
-  pImpl->setOpaquePointers(Enable);
+StringRef LLVMContext::getDefaultTargetCPU() {
+  return pImpl->DefaultTargetCPU;
 }
 
-bool LLVMContext::supportsTypedPointers() const {
-  return !pImpl->getOpaquePointers();
+void LLVMContext::setDefaultTargetCPU(StringRef CPU) {
+  pImpl->DefaultTargetCPU = CPU;
+}
+
+StringRef LLVMContext::getDefaultTargetFeatures() {
+  return pImpl->DefaultTargetFeatures;
+}
+
+void LLVMContext::setDefaultTargetFeatures(StringRef Features) {
+  pImpl->DefaultTargetFeatures = Features;
 }

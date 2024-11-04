@@ -10,19 +10,26 @@
 // This pass inserts the necessary  instructions to adjust for the inconsistency
 // of the call-frame information caused by final machine basic block layout.
 // The pass relies in constraints LLVM imposes on the placement of
-// save/restore points (cf. ShrinkWrap):
-// * there is a single basic block, containing the function prologue
-// * possibly multiple epilogue blocks, where each epilogue block is
-//   complete and self-contained, i.e. CSR restore instructions (and the
-//   corresponding CFI instructions are not split across two or more blocks.
-// * prologue and epilogue blocks are outside of any loops
-// Thus, during execution, at the beginning and at the end of each basic block
-// the function can be in one of two states:
+// save/restore points (cf. ShrinkWrap) and has certain preconditions about
+// placement of CFI instructions:
+// * For any two CFI instructions of the function prologue one dominates
+//   and is post-dominated by the other.
+// * The function possibly contains multiple epilogue blocks, where each
+//   epilogue block is complete and self-contained, i.e. CSR restore
+//   instructions (and the corresponding CFI instructions)
+//   are not split across two or more blocks.
+// * CFI instructions are not contained in any loops.
+
+// Thus, during execution, at the beginning and at the end of each basic block,
+// following the prologue, the function can be in one of two states:
 //  - "has a call frame", if the function has executed the prologue, and
 //    has not executed any epilogue
 //  - "does not have a call frame", if the function has not executed the
 //    prologue, or has executed an epilogue
 // which can be computed by a single RPO traversal.
+
+// The location of the prologue is determined by finding the first block in the
+// reverse traversal which contains CFI instructions.
 
 // In order to accommodate backends which do not generate unwind info in
 // epilogues we compute an additional property "strong no call frame on entry",
@@ -85,15 +92,63 @@ static bool isPrologueCFIInstruction(const MachineInstr &MI) {
          MI.getFlag(MachineInstr::FrameSetup);
 }
 
-static bool containsPrologue(const MachineBasicBlock &MBB) {
-  return llvm::any_of(MBB.instrs(), isPrologueCFIInstruction);
-}
-
 static bool containsEpilogue(const MachineBasicBlock &MBB) {
   return llvm::any_of(llvm::reverse(MBB), [](const auto &MI) {
     return MI.getOpcode() == TargetOpcode::CFI_INSTRUCTION &&
            MI.getFlag(MachineInstr::FrameDestroy);
   });
+}
+
+static MachineBasicBlock *
+findPrologueEnd(MachineFunction &MF, MachineBasicBlock::iterator &PrologueEnd) {
+  // Even though we should theoretically traverse the blocks in post-order, we
+  // can't encode correctly cases where prologue blocks are not laid out in
+  // topological order. Then, assuming topological order, we can just traverse
+  // the function in reverse.
+  for (MachineBasicBlock &MBB : reverse(MF)) {
+    for (MachineInstr &MI : reverse(MBB.instrs())) {
+      if (!isPrologueCFIInstruction(MI))
+        continue;
+      PrologueEnd = std::next(MI.getIterator());
+      return &MBB;
+    }
+  }
+  return nullptr;
+}
+
+// Represents the point within a basic block where we can insert an instruction.
+// Note that we need the MachineBasicBlock* as well as the iterator since the
+// iterator can point to the end of the block. Instructions are inserted
+// *before* the iterator.
+struct InsertionPoint {
+  MachineBasicBlock *MBB;
+  MachineBasicBlock::iterator Iterator;
+};
+
+// Inserts a `.cfi_remember_state` instruction before PrologueEnd and a
+// `.cfi_restore_state` instruction before DstInsertPt. Returns an iterator
+// to the first instruction after the inserted `.cfi_restore_state` instruction.
+static InsertionPoint
+insertRememberRestorePair(const InsertionPoint &RememberInsertPt,
+                          const InsertionPoint &RestoreInsertPt) {
+  MachineFunction &MF = *RememberInsertPt.MBB->getParent();
+  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
+
+  // Insert the `.cfi_remember_state` instruction.
+  unsigned CFIIndex =
+      MF.addFrameInst(MCCFIInstruction::createRememberState(nullptr));
+  BuildMI(*RememberInsertPt.MBB, RememberInsertPt.Iterator, DebugLoc(),
+          TII.get(TargetOpcode::CFI_INSTRUCTION))
+      .addCFIIndex(CFIIndex);
+
+  // Insert the `.cfi_restore_state` instruction.
+  CFIIndex = MF.addFrameInst(MCCFIInstruction::createRestoreState(nullptr));
+
+  return {RestoreInsertPt.MBB,
+          std::next(BuildMI(*RestoreInsertPt.MBB, RestoreInsertPt.Iterator,
+                            DebugLoc(), TII.get(TargetOpcode::CFI_INSTRUCTION))
+                        .addCFIIndex(CFIIndex)
+                        ->getIterator())};
 }
 
 bool CFIFixup::runOnMachineFunction(MachineFunction &MF) {
@@ -103,6 +158,13 @@ bool CFIFixup::runOnMachineFunction(MachineFunction &MF) {
 
   const unsigned NumBlocks = MF.getNumBlockIDs();
   if (NumBlocks < 2)
+    return false;
+
+  // Find the prologue and the point where we can issue the first
+  // `.cfi_remember_state`.
+  MachineBasicBlock::iterator PrologueEnd;
+  MachineBasicBlock *PrologueBlock = findPrologueEnd(MF, PrologueEnd);
+  if (PrologueBlock == nullptr)
     return false;
 
   struct BlockFlags {
@@ -116,20 +178,14 @@ bool CFIFixup::runOnMachineFunction(MachineFunction &MF) {
   BlockInfo[0].StrongNoFrameOnEntry = true;
 
   // Compute the presence/absence of frame at each basic block.
-  MachineBasicBlock *PrologueBlock = nullptr;
   ReversePostOrderTraversal<MachineBasicBlock *> RPOT(&*MF.begin());
   for (MachineBasicBlock *MBB : RPOT) {
     BlockFlags &Info = BlockInfo[MBB->getNumber()];
 
     // Set to true if the current block contains the prologue or the epilogue,
     // respectively.
-    bool HasPrologue = false;
+    bool HasPrologue = MBB == PrologueBlock;
     bool HasEpilogue = false;
-
-    if (!PrologueBlock && !Info.HasFrameOnEntry && containsPrologue(*MBB)) {
-      PrologueBlock = MBB;
-      HasPrologue = true;
-    }
 
     if (Info.HasFrameOnEntry || HasPrologue)
       HasEpilogue = containsEpilogue(*MBB);
@@ -149,25 +205,17 @@ bool CFIFixup::runOnMachineFunction(MachineFunction &MF) {
     }
   }
 
-  if (!PrologueBlock)
-    return false;
-
   // Walk the blocks of the function in "physical" order.
   // Every block inherits the frame state (as recorded in the unwind tables)
   // of the previous block. If the intended frame state is different, insert
   // compensating CFI instructions.
-  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
   bool Change = false;
   // `InsertPt` always points to the point in a preceding block where we have to
   // insert a `.cfi_remember_state`, in the case that the current block needs a
   // `.cfi_restore_state`.
-  MachineBasicBlock *InsertMBB = PrologueBlock;
-  MachineBasicBlock::iterator InsertPt = PrologueBlock->begin();
-  for (MachineInstr &MI : *PrologueBlock)
-    if (isPrologueCFIInstruction(MI))
-      InsertPt = std::next(MI.getIterator());
+  InsertionPoint InsertPt = {PrologueBlock, PrologueEnd};
 
-  assert(InsertPt != PrologueBlock->begin() &&
+  assert(PrologueEnd != PrologueBlock->begin() &&
          "Inconsistent notion of \"prologue block\"");
 
   // No point starting before the prologue block.
@@ -195,20 +243,11 @@ bool CFIFixup::runOnMachineFunction(MachineFunction &MF) {
     if (!Info.StrongNoFrameOnEntry && Info.HasFrameOnEntry && !HasFrame) {
       // Reset to the "after prologue" state.
 
-      // Insert a `.cfi_remember_state` into the last block known to have a
-      // stack frame.
-      unsigned CFIIndex =
-          MF.addFrameInst(MCCFIInstruction::createRememberState(nullptr));
-      BuildMI(*InsertMBB, InsertPt, DebugLoc(),
-              TII.get(TargetOpcode::CFI_INSTRUCTION))
-          .addCFIIndex(CFIIndex);
-      // Insert a `.cfi_restore_state` at the beginning of the current block.
-      CFIIndex = MF.addFrameInst(MCCFIInstruction::createRestoreState(nullptr));
-      InsertPt = BuildMI(*CurrBB, CurrBB->begin(), DebugLoc(),
-                         TII.get(TargetOpcode::CFI_INSTRUCTION))
-                     .addCFIIndex(CFIIndex);
-      ++InsertPt;
-      InsertMBB = &*CurrBB;
+      // There's an earlier block known to have a stack frame. Insert a
+      // `.cfi_remember_state` instruction into that block and a
+      // `.cfi_restore_state` instruction at the beginning of the current block.
+      InsertPt = insertRememberRestorePair(
+          InsertPt, InsertionPoint{&*CurrBB, CurrBB->begin()});
       Change = true;
     } else if ((Info.StrongNoFrameOnEntry || !Info.HasFrameOnEntry) &&
                HasFrame) {

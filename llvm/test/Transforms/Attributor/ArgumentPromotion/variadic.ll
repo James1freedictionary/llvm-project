@@ -16,13 +16,13 @@ target triple = "x86_64-unknown-linux-gnu"
 
 ; Function Attrs: nounwind uwtable
 ;.
-; CHECK: @[[T45:[a-zA-Z0-9_$"\\.-]+]] = internal global [[STRUCT_TT0:%.*]] { i64 1335139741, i64 438042995 }, align 8
+; CHECK: @t45 = internal global %struct.tt0 { i64 1335139741, i64 438042995 }, align 8
 ;.
 define i32 @main(i32 %argc, ptr nocapture readnone %argv) #0 {
 ; CHECK-LABEL: define {{[^@]+}}@main
 ; CHECK-SAME: (i32 [[ARGC:%.*]], ptr nocapture nofree readnone [[ARGV:%.*]]) {
 ; CHECK-NEXT:  entry:
-; CHECK-NEXT:    tail call void (ptr, ptr, ptr, ptr, ptr, ...) @callee_t0f(ptr undef, ptr undef, ptr undef, ptr undef, ptr undef, ptr noalias noundef nonnull byval([[STRUCT_TT0:%.*]]) align 8 dereferenceable(16) @t45)
+; CHECK-NEXT:    tail call void (ptr, ptr, ptr, ptr, ptr, ...) @callee_t0f(ptr nofree undef, ptr nofree undef, ptr nofree undef, ptr nofree undef, ptr nofree undef, ptr noalias noundef nonnull byval([[STRUCT_TT0:%.*]]) align 8 dereferenceable(16) @t45)
 ; CHECK-NEXT:    ret i32 0
 ;
 entry:

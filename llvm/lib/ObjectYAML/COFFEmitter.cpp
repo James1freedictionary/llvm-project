@@ -16,7 +16,6 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/DebugInfo/CodeView/DebugStringTableSubsection.h"
 #include "llvm/DebugInfo/CodeView/StringsAndChecksums.h"
-#include "llvm/Object/COFF.h"
 #include "llvm/ObjectYAML/ObjectYAML.h"
 #include "llvm/ObjectYAML/yaml2obj.h"
 #include "llvm/Support/BinaryStreamWriter.h"
@@ -48,10 +47,7 @@ struct COFFParser {
   }
 
   bool isPE() const { return Obj.OptionalHeader.has_value(); }
-  bool is64Bit() const {
-    return Obj.Header.Machine == COFF::IMAGE_FILE_MACHINE_AMD64 ||
-           COFF::isAnyArm64(Obj.Header.Machine);
-  }
+  bool is64Bit() const { return COFF::is64Bit(Obj.Header.Machine); }
 
   uint32_t getFileAlignment() const {
     return Obj.OptionalHeader->Header.FileAlignment;
@@ -129,15 +125,12 @@ struct COFFParser {
   }
 
   unsigned getStringIndex(StringRef Str) {
-    StringMap<unsigned>::iterator i = StringTableMap.find(Str);
-    if (i == StringTableMap.end()) {
-      unsigned Index = StringTable.size();
+    auto [It, Inserted] = StringTableMap.try_emplace(Str, StringTable.size());
+    if (Inserted) {
       StringTable.append(Str.begin(), Str.end());
       StringTable.push_back(0);
-      StringTableMap[Str] = Index;
-      return Index;
     }
-    return i->second;
+    return It->second;
   }
 
   COFFYAML::Object &Obj;
@@ -186,7 +179,7 @@ toDebugS(ArrayRef<CodeViewYAML::YAMLDebugSubsection> Subsections,
   }
   uint8_t *Buffer = Allocator.Allocate<uint8_t>(Size);
   MutableArrayRef<uint8_t> Output(Buffer, Size);
-  BinaryStreamWriter Writer(Output, support::little);
+  BinaryStreamWriter Writer(Output, llvm::endianness::little);
 
   Err(Writer.writeInteger<uint32_t>(COFF::DEBUG_SECTION_MAGIC));
   for (const auto &B : Builders) {
@@ -318,8 +311,8 @@ template <typename value_type>
 raw_ostream &operator<<(raw_ostream &OS,
                         const binary_le_impl<value_type> &BLE) {
   char Buffer[sizeof(BLE.Value)];
-  support::endian::write<value_type, support::little, support::unaligned>(
-      Buffer, BLE.Value);
+  support::endian::write<value_type, llvm::endianness::little>(Buffer,
+                                                               BLE.Value);
   OS.write(Buffer, sizeof(BLE.Value));
   return OS;
 }
@@ -363,9 +356,9 @@ static uint32_t initializeOptionalHeader(COFFParser &CP, uint16_t Magic,
       SizeOfInitializedData += S.Header.SizeOfRawData;
     if (S.Header.Characteristics & COFF::IMAGE_SCN_CNT_UNINITIALIZED_DATA)
       SizeOfUninitializedData += S.Header.SizeOfRawData;
-    if (S.Name.equals(".text"))
+    if (S.Name == ".text")
       Header->BaseOfCode = S.Header.VirtualAddress; // RVA
-    else if (S.Name.equals(".data"))
+    else if (S.Name == ".data")
       BaseOfData = S.Header.VirtualAddress; // RVA
     if (S.Header.VirtualAddress)
       SizeOfImage += alignTo(S.Header.VirtualSize, Header->SectionAlignment);
@@ -598,13 +591,28 @@ size_t COFFYAML::SectionDataEntry::size() const {
   size_t Size = Binary.binary_size();
   if (UInt32)
     Size += sizeof(*UInt32);
+  if (LoadConfig32)
+    Size += LoadConfig32->Size;
+  if (LoadConfig64)
+    Size += LoadConfig64->Size;
   return Size;
+}
+
+template <typename T> static void writeLoadConfig(T &S, raw_ostream &OS) {
+  OS.write(reinterpret_cast<const char *>(&S),
+           std::min(sizeof(S), static_cast<size_t>(S.Size)));
+  if (sizeof(S) < S.Size)
+    OS.write_zeros(S.Size - sizeof(S));
 }
 
 void COFFYAML::SectionDataEntry::writeAsBinary(raw_ostream &OS) const {
   if (UInt32)
     OS << binary_le(*UInt32);
   Binary.writeAsBinary(OS);
+  if (LoadConfig32)
+    writeLoadConfig(*LoadConfig32, OS);
+  if (LoadConfig64)
+    writeLoadConfig(*LoadConfig64, OS);
 }
 
 namespace llvm {

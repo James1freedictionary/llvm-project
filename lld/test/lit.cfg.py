@@ -40,6 +40,7 @@ llvm_config.use_lld()
 tool_patterns = [
     "llc",
     "llvm-as",
+    "llvm-cgdata",
     "llvm-mc",
     "llvm-nm",
     "llvm-objdump",
@@ -67,14 +68,6 @@ if platform.system() in ["NetBSD"]:
 if lit_config.useValgrind:
     config.target_triple += "-vg"
 
-# Running on ELF based *nix
-if platform.system() in ["FreeBSD", "NetBSD", "Linux"]:
-    config.available_features.add("system-linker-elf")
-
-# Set if host-cxxabi's demangler can handle target's symbols.
-if platform.system() not in ["Windows"]:
-    config.available_features.add("demangler")
-
 llvm_config.feature_config(
     [
         (
@@ -85,11 +78,13 @@ llvm_config.feature_config(
                 "ARM": "arm",
                 "AVR": "avr",
                 "Hexagon": "hexagon",
+                "LoongArch": "loongarch",
                 "Mips": "mips",
                 "MSP430": "msp430",
                 "PowerPC": "ppc",
                 "RISCV": "riscv",
                 "Sparc": "sparc",
+                "SystemZ": "systemz",
                 "WebAssembly": "wasm",
                 "X86": "x86",
             },

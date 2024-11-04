@@ -102,6 +102,26 @@ def FeatureUAL
     : SubtargetFeature<"ual", "HasUAL", "true",
                        "Allow memory accesses to be unaligned">;
 
+def FeatureRelax
+    : SubtargetFeature<"relax", "HasLinkerRelax", "true",
+                       "Enable Linker relaxation">;
+
+// Floating point approximation operation
+def FeatureFrecipe
+    : SubtargetFeature<"frecipe", "HasFrecipe", "true",
+                       "Support frecipe.{s/d} and frsqrte.{s/d} instructions.">;
+def HasFrecipe : Predicate<"Subtarget->hasFrecipe()">;
+
+// Atomic memory swap and add instructions for byte and half word
+def FeatureLAM_BH
+    : SubtargetFeature<"lam-bh", "HasLAM_BH", "true",
+                        "Support amswap[_db].{b/h} and amadd[_db].{b/h} instructions.">;
+def HasLAM_BH : Predicate<"Subtarget->hasLAM_BH()">;
+
+def TunePreferWInst
+    : SubtargetFeature<"prefer-w-inst", "PreferWInst", "true",
+                       "Prefer instructions with W suffix">;
+
 //===----------------------------------------------------------------------===//
 // Registers, instruction descriptions ...
 //===----------------------------------------------------------------------===//
@@ -115,7 +135,14 @@ include "LoongArchInstrInfo.td"
 //===----------------------------------------------------------------------===//
 
 def : ProcessorModel<"generic-la32", NoSchedModel, [Feature32Bit]>;
-def : ProcessorModel<"generic-la64", NoSchedModel, [Feature64Bit, FeatureUAL]>;
+def : ProcessorModel<"generic-la64", NoSchedModel, [Feature64Bit,
+                                                    FeatureUAL,
+                                                    FeatureExtLSX]>;
+
+// Generic 64-bit processor with double-precision floating-point support.
+def : ProcessorModel<"loongarch64", NoSchedModel, [Feature64Bit,
+                                                   FeatureUAL,
+                                                   FeatureBasicD]>;
 
 // Support generic for compatibility with other targets. The triple will be used
 // to change to the appropriate la32/la64 version.
@@ -127,14 +154,20 @@ def : ProcessorModel<"la464", NoSchedModel, [Feature64Bit,
                                              FeatureExtLVZ,
                                              FeatureExtLBT]>;
 
+def : ProcessorModel<"la664", NoSchedModel, [Feature64Bit,
+                                             FeatureUAL,
+                                             FeatureExtLASX,
+                                             FeatureExtLVZ,
+                                             FeatureExtLBT,
+                                             FeatureFrecipe,
+                                             FeatureLAM_BH]>;
+
 //===----------------------------------------------------------------------===//
 // Define the LoongArch target.
 //===----------------------------------------------------------------------===//
 
 def LoongArchInstrInfo : InstrInfo {
-  // guess mayLoad, mayStore, and hasSideEffects
-  // This option is a temporary migration help. It will go away.
-  let guessInstructionProperties = 1;
+  let guessInstructionProperties = 0;
 }
 
 def LoongArchAsmParser : AsmParser {

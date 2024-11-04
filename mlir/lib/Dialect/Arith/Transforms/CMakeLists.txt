@@ -1,6 +1,8 @@
 add_mlir_dialect_library(MLIRArithTransforms
+  BufferDeallocationOpInterfaceImpl.cpp
   BufferizableOpInterfaceImpl.cpp
-  Bufferize.cpp
+  BufferViewFlowOpInterfaceImpl.cpp
+  EmulateUnsupportedFloats.cpp
   EmulateWideInt.cpp
   EmulateNarrowType.cpp
   ExpandOps.cpp
@@ -18,8 +20,6 @@ add_mlir_dialect_library(MLIRArithTransforms
   LINK_LIBS PUBLIC
   MLIRAnalysis
   MLIRArithDialect
-  MLIRBufferizationDialect
-  MLIRBufferizationTransforms
   MLIRFuncDialect
   MLIRFuncTransforms
   MLIRInferIntRangeInterface

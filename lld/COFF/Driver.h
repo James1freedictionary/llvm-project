@@ -84,6 +84,8 @@ public:
   // config->machine has been set.
   void addWinSysRootLibSearchPaths();
 
+  void addClangLibSearchPaths(const std::string &argv0);
+
   // Used by the resolver to parse .drectve section contents.
   void parseDirectives(InputFile *file);
 
@@ -98,6 +100,8 @@ public:
   void enqueuePath(StringRef path, bool wholeArchive, bool lazy);
 
   std::unique_ptr<llvm::TarWriter> tar; // for /linkrepro
+
+  void pullArm64ECIcallHelper();
 
 private:
   // Searches a file from search paths.
@@ -166,7 +170,9 @@ private:
 
   std::set<std::string> visitedLibs;
 
-  Symbol *addUndefined(StringRef sym);
+  Symbol *addUndefined(StringRef sym, bool aliasEC = false);
+
+  void addUndefinedGlob(StringRef arg);
 
   StringRef mangleMaybe(Symbol *s);
 
@@ -231,6 +237,9 @@ private:
   // Parses a string in the form of "[:<integer>]"
   void parseFunctionPadMin(llvm::opt::Arg *a);
 
+  // Parses a string in the form of "[:<integer>]"
+  void parseDependentLoadFlags(llvm::opt::Arg *a);
+
   // Parses a string in the form of "EMBED[,=<integer>]|NO".
   void parseManifest(StringRef arg);
 
@@ -265,12 +274,16 @@ private:
   // Convert Windows resource files (.res files) to a .obj file.
   MemoryBufferRef convertResToCOFF(ArrayRef<MemoryBufferRef> mbs,
                                    ArrayRef<ObjFile *> objs);
+
+  // Create export thunks for exported and patchable Arm64EC function symbols.
+  void createECExportThunks();
+  void maybeCreateECExportThunk(StringRef name, Symbol *&sym);
 };
 
 // Create enum with OPT_xxx values for each option in Options.td
 enum {
   OPT_INVALID = 0,
-#define OPTION(_1, _2, ID, _4, _5, _6, _7, _8, _9, _10, _11, _12) OPT_##ID,
+#define OPTION(...) LLVM_MAKE_OPT_ID(__VA_ARGS__),
 #include "Options.inc"
 #undef OPTION
 };

@@ -11,6 +11,7 @@ static_library("Utility") {
 
     #"//lldb/source/Target", # Dependency cycle.
     "//lldb/source/Utility",
+    "//lldb/source/ValueObject",
     "//llvm/lib/Support",
     "//llvm/lib/TargetParser",
   ]
@@ -66,11 +67,13 @@ static_library("Utility") {
     "RegisterContextWindows_i386.cpp",
     "RegisterContextWindows_x86_64.cpp",
     "RegisterContext_x86.cpp",
+    "RegisterFlagsDetector_arm64.cpp",
     "RegisterInfoPOSIX_arm.cpp",
     "RegisterInfoPOSIX_arm64.cpp",
     "RegisterInfoPOSIX_loongarch64.cpp",
     "RegisterInfoPOSIX_ppc64le.cpp",
     "RegisterInfoPOSIX_riscv64.cpp",
+    "RegisterInfos_x86_64_with_base_shared.cpp",
     "StopInfoMachException.cpp",
     "ThreadMemory.cpp",
   ]

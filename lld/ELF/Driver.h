@@ -15,6 +15,8 @@
 #include <optional>
 
 namespace lld::elf {
+struct Ctx;
+
 // Parses command line options.
 class ELFOptTable : public llvm::opt::GenericOptTable {
 public:
@@ -25,18 +27,18 @@ public:
 // Create enum with OPT_xxx values for each option in Options.td
 enum {
   OPT_INVALID = 0,
-#define OPTION(_1, _2, ID, _4, _5, _6, _7, _8, _9, _10, _11, _12) OPT_##ID,
+#define OPTION(...) LLVM_MAKE_OPT_ID(__VA_ARGS__),
 #include "Options.inc"
 #undef OPTION
 };
 
-void printHelp();
+void printHelp(Ctx &ctx);
 std::string createResponseFile(const llvm::opt::InputArgList &args);
 
-std::optional<std::string> findFromSearchPaths(StringRef path);
-std::optional<std::string> searchScript(StringRef path);
-std::optional<std::string> searchLibraryBaseName(StringRef path);
-std::optional<std::string> searchLibrary(StringRef path);
+std::optional<std::string> findFromSearchPaths(Ctx &, StringRef path);
+std::optional<std::string> searchScript(Ctx &, StringRef path);
+std::optional<std::string> searchLibraryBaseName(Ctx &, StringRef path);
+std::optional<std::string> searchLibrary(Ctx &, StringRef path);
 
 } // namespace lld::elf
 

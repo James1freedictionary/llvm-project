@@ -6,11 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "include/llvm-libc-types/test_rpc_opcodes_t.h"
 #include "src/__support/GPU/utils.h"
 #include "src/__support/RPC/rpc_client.h"
 #include "test/IntegrationTest/test.h"
 
-using namespace __llvm_libc;
+using namespace LIBC_NAMESPACE;
 
 static void test_add_simple() {
   uint32_t num_additions =
@@ -19,10 +20,10 @@ static void test_add_simple() {
   for (uint32_t i = 0; i < num_additions; ++i) {
     rpc::Client::Port port = rpc::client.open<RPC_TEST_INCREMENT>();
     port.send_and_recv(
-        [=](rpc::Buffer *buffer) {
+        [=](rpc::Buffer *buffer, uint32_t) {
           reinterpret_cast<uint64_t *>(buffer->data)[0] = cnt;
         },
-        [&](rpc::Buffer *buffer) {
+        [&](rpc::Buffer *buffer, uint32_t) {
           cnt = reinterpret_cast<uint64_t *>(buffer->data)[0];
         });
     port.close();
@@ -33,7 +34,7 @@ static void test_add_simple() {
 // Test to ensure that the RPC mechanism doesn't hang on divergence.
 static void test_noop(uint8_t data) {
   rpc::Client::Port port = rpc::client.open<RPC_NOOP>();
-  port.send([=](rpc::Buffer *buffer) { buffer->data[0] = data; });
+  port.send([=](rpc::Buffer *buffer, uint32_t) { buffer->data[0] = data; });
   port.close();
 }
 

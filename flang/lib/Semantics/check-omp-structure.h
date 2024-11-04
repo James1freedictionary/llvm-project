@@ -17,11 +17,9 @@
 #include "check-directive-structure.h"
 #include "flang/Common/enum-set.h"
 #include "flang/Parser/parse-tree.h"
+#include "flang/Semantics/openmp-directive-sets.h"
 #include "flang/Semantics/semantics.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
-
-using OmpDirectiveSet = Fortran::common::EnumSet<llvm::omp::Directive,
-    llvm::omp::Directive_enumSize>;
 
 using OmpClauseSet =
     Fortran::common::EnumSet<llvm::omp::Clause, llvm::omp::Clause_enumSize>;
@@ -31,79 +29,21 @@ using OmpClauseSet =
 
 namespace llvm {
 namespace omp {
-static OmpDirectiveSet parallelSet{Directive::OMPD_distribute_parallel_do,
-    Directive::OMPD_distribute_parallel_do_simd, Directive::OMPD_parallel,
-    Directive::OMPD_parallel_do, Directive::OMPD_parallel_do_simd,
-    Directive::OMPD_parallel_sections, Directive::OMPD_parallel_workshare,
-    Directive::OMPD_target_parallel, Directive::OMPD_target_parallel_do,
-    Directive::OMPD_target_parallel_do_simd,
-    Directive::OMPD_target_teams_distribute_parallel_do,
-    Directive::OMPD_target_teams_distribute_parallel_do_simd,
-    Directive::OMPD_teams_distribute_parallel_do,
-    Directive::OMPD_teams_distribute_parallel_do_simd};
-static OmpDirectiveSet doSet{Directive::OMPD_distribute_parallel_do,
-    Directive::OMPD_distribute_parallel_do_simd, Directive::OMPD_parallel_do,
-    Directive::OMPD_parallel_do_simd, Directive::OMPD_do,
-    Directive::OMPD_do_simd, Directive::OMPD_target_parallel_do,
-    Directive::OMPD_target_parallel_do_simd,
-    Directive::OMPD_target_teams_distribute_parallel_do,
-    Directive::OMPD_target_teams_distribute_parallel_do_simd,
-    Directive::OMPD_teams_distribute_parallel_do,
-    Directive::OMPD_teams_distribute_parallel_do_simd};
-static OmpDirectiveSet doSimdSet{Directive::OMPD_distribute_parallel_do_simd,
-    Directive::OMPD_parallel_do_simd, Directive::OMPD_do_simd,
-    Directive::OMPD_target_parallel_do_simd,
-    Directive::OMPD_target_teams_distribute_parallel_do_simd,
-    Directive::OMPD_teams_distribute_parallel_do_simd};
-static OmpDirectiveSet workShareSet{
-    OmpDirectiveSet{Directive::OMPD_workshare,
-        Directive::OMPD_parallel_workshare, Directive::OMPD_parallel_sections,
-        Directive::OMPD_sections, Directive::OMPD_single} |
-    doSet};
-static OmpDirectiveSet taskloopSet{
-    Directive::OMPD_taskloop, Directive::OMPD_taskloop_simd};
-static OmpDirectiveSet targetSet{Directive::OMPD_target,
-    Directive::OMPD_target_parallel, Directive::OMPD_target_parallel_do,
-    Directive::OMPD_target_parallel_do_simd, Directive::OMPD_target_simd,
-    Directive::OMPD_target_teams, Directive::OMPD_target_teams_distribute,
-    Directive::OMPD_target_teams_distribute_simd};
-static OmpDirectiveSet simdSet{Directive::OMPD_distribute_parallel_do_simd,
-    Directive::OMPD_distribute_simd, Directive::OMPD_parallel_do_simd,
-    Directive::OMPD_do_simd, Directive::OMPD_simd,
-    Directive::OMPD_target_parallel_do_simd,
-    Directive::OMPD_target_teams_distribute_parallel_do_simd,
-    Directive::OMPD_target_teams_distribute_simd, Directive::OMPD_target_simd,
-    Directive::OMPD_taskloop_simd,
-    Directive::OMPD_teams_distribute_parallel_do_simd,
-    Directive::OMPD_teams_distribute_simd};
-static OmpDirectiveSet teamSet{Directive::OMPD_teams,
-    Directive::OMPD_teams_distribute,
-    Directive::OMPD_teams_distribute_parallel_do,
-    Directive::OMPD_teams_distribute_parallel_do_simd,
-    Directive::OMPD_teams_distribute_parallel_for,
-    Directive::OMPD_teams_distribute_parallel_for_simd,
-    Directive::OMPD_teams_distribute_simd};
-static OmpDirectiveSet taskGeneratingSet{
-    OmpDirectiveSet{Directive::OMPD_task} | taskloopSet};
-static OmpDirectiveSet nestedOrderedErrSet{Directive::OMPD_critical,
-    Directive::OMPD_ordered, Directive::OMPD_atomic, Directive::OMPD_task,
-    Directive::OMPD_taskloop};
-static OmpDirectiveSet nestedWorkshareErrSet{
-    OmpDirectiveSet{Directive::OMPD_task, Directive::OMPD_taskloop,
-        Directive::OMPD_critical, Directive::OMPD_ordered,
-        Directive::OMPD_atomic, Directive::OMPD_master} |
-    workShareSet};
-static OmpDirectiveSet nestedMasterErrSet{
-    OmpDirectiveSet{llvm::omp::Directive::OMPD_atomic} | taskGeneratingSet |
-    workShareSet};
-static OmpDirectiveSet nestedBarrierErrSet{
-    OmpDirectiveSet{Directive::OMPD_critical, Directive::OMPD_ordered,
-        Directive::OMPD_atomic, Directive::OMPD_master} |
-    taskGeneratingSet | workShareSet};
 static OmpClauseSet privateSet{
     Clause::OMPC_private, Clause::OMPC_firstprivate, Clause::OMPC_lastprivate};
 static OmpClauseSet privateReductionSet{
     OmpClauseSet{Clause::OMPC_reduction} | privateSet};
+// omp.td cannot differentiate allowed/not allowed clause list for few
+// directives for fortran. nowait is not allowed on begin directive clause list
+// for below list of directives. Directives with conflicting list of clauses are
+// included in below list.
+static const OmpDirectiveSet noWaitClauseNotAllowedSet{
+    Directive::OMPD_do,
+    Directive::OMPD_do_simd,
+    Directive::OMPD_sections,
+    Directive::OMPD_single,
+    Directive::OMPD_workshare,
+};
 } // namespace omp
 } // namespace llvm
 
@@ -129,9 +69,11 @@ public:
   using llvmOmpClause = const llvm::omp::Clause;
 
   void Enter(const parser::OpenMPConstruct &);
+  void Leave(const parser::OpenMPConstruct &);
   void Enter(const parser::OpenMPLoopConstruct &);
   void Leave(const parser::OpenMPLoopConstruct &);
   void Enter(const parser::OmpEndLoopDirective &);
+  void Leave(const parser::OmpEndLoopDirective &);
 
   void Enter(const parser::OpenMPBlockConstruct &);
   void Leave(const parser::OpenMPBlockConstruct &);
@@ -150,8 +92,15 @@ public:
   void Leave(const parser::OpenMPDeclarativeAllocate &);
   void Enter(const parser::OpenMPDeclareTargetConstruct &);
   void Leave(const parser::OpenMPDeclareTargetConstruct &);
+  void Enter(const parser::OpenMPDepobjConstruct &);
+  void Leave(const parser::OpenMPDepobjConstruct &);
+  void Enter(const parser::OmpDeclareTargetWithList &);
+  void Enter(const parser::OmpDeclareTargetWithClause &);
+  void Leave(const parser::OmpDeclareTargetWithClause &);
   void Enter(const parser::OpenMPExecutableAllocate &);
   void Leave(const parser::OpenMPExecutableAllocate &);
+  void Enter(const parser::OpenMPAllocatorsConstruct &);
+  void Leave(const parser::OpenMPAllocatorsConstruct &);
   void Enter(const parser::OpenMPRequiresConstruct &);
   void Leave(const parser::OpenMPRequiresConstruct &);
   void Enter(const parser::OpenMPThreadprivate &);
@@ -185,15 +134,16 @@ public:
 #define GEN_FLANG_CLAUSE_CHECK_ENTER
 #include "llvm/Frontend/OpenMP/OMP.inc"
 
-  // Get the OpenMP Clause Kind for the corresponding Parser class
-  template <typename A>
-  llvm::omp::Clause GetClauseKindForParserClass(const A &) {
-#define GEN_FLANG_CLAUSE_PARSER_KIND_MAP
-#include "llvm/Frontend/OpenMP/OMP.inc"
-  }
-
 private:
+  bool CheckAllowedClause(llvmOmpClause clause);
+  bool IsVariableListItem(const Symbol &sym);
+  bool IsExtendedListItem(const Symbol &sym);
+  void CheckMultipleOccurrence(semantics::UnorderedSymbolSet &listVars,
+      const std::list<parser::Name> &nameList, const parser::CharBlock &item,
+      const std::string &clauseName);
   void CheckMultListItems();
+  void CheckStructureElement(const parser::OmpObjectList &ompObjectList,
+      const llvm::omp::Clause clause);
   bool HasInvalidWorksharingNesting(
       const parser::CharBlock &, const OmpDirectiveSet &);
   bool IsCloselyNestedRegion(const OmpDirectiveSet &set);
@@ -203,8 +153,9 @@ private:
   // specific clause related
   bool ScheduleModifierHasType(const parser::OmpScheduleClause &,
       const parser::OmpScheduleModifierType::ModType &);
-  void CheckAllowedMapTypes(const parser::OmpMapType::Type &,
-      const std::list<parser::OmpMapType::Type> &);
+  void CheckAllowedMapTypes(const parser::OmpMapClause::Type &,
+      const std::list<parser::OmpMapClause::Type> &);
+  template <typename T> const T *FindDuplicateEntry(const std::list<T> &);
   llvm::StringRef getClauseName(llvm::omp::Clause clause) override;
   llvm::StringRef getDirectiveName(llvm::omp::Directive directive) override;
 
@@ -212,8 +163,8 @@ private:
   void CheckDependArraySection(
       const common::Indirection<parser::ArrayElement> &, const parser::Name &);
   bool IsDataRefTypeParamInquiry(const parser::DataRef *dataRef);
-  void CheckIsVarPartOfAnotherVar(
-      const parser::CharBlock &source, const parser::OmpObjectList &objList);
+  void CheckIsVarPartOfAnotherVar(const parser::CharBlock &source,
+      const parser::OmpObjectList &objList, llvm::StringRef clause = "");
   void CheckThreadprivateOrDeclareTargetVar(
       const parser::OmpObjectList &objList);
   void CheckSymbolNames(
@@ -233,17 +184,23 @@ private:
   bool CheckTargetBlockOnlyTeams(const parser::Block &);
   void CheckWorkshareBlockStmts(const parser::Block &, parser::CharBlock);
 
+  void CheckIteratorRange(const parser::OmpIteratorSpecifier &x);
+  void CheckIteratorModifier(const parser::OmpIteratorModifier &x);
   void CheckLoopItrVariableIsInt(const parser::OpenMPLoopConstruct &x);
   void CheckDoWhile(const parser::OpenMPLoopConstruct &x);
-  void CheckCycleConstraints(const parser::OpenMPLoopConstruct &x);
+  void CheckAssociatedLoopConstraints(const parser::OpenMPLoopConstruct &x);
   template <typename T, typename D> bool IsOperatorValid(const T &, const D &);
   void CheckAtomicMemoryOrderClause(
       const parser::OmpAtomicClauseList *, const parser::OmpAtomicClauseList *);
-  void CheckAtomicUpdateAssignmentStmt(const parser::AssignmentStmt &);
+  void CheckAtomicUpdateStmt(const parser::AssignmentStmt &);
+  void CheckAtomicCaptureStmt(const parser::AssignmentStmt &);
+  void CheckAtomicWriteStmt(const parser::AssignmentStmt &);
+  void CheckAtomicCaptureConstruct(const parser::OmpAtomicCapture &);
   void CheckAtomicConstructStructure(const parser::OpenMPAtomicConstruct &);
   void CheckDistLinear(const parser::OpenMPLoopConstruct &x);
   void CheckSIMDNest(const parser::OpenMPConstruct &x);
   void CheckTargetNest(const parser::OpenMPConstruct &x);
+  void CheckTargetUpdate();
   void CheckCancellationNest(
       const parser::CharBlock &source, const parser::OmpCancelType::Type &type);
   std::int64_t GetOrdCollapseLevel(const parser::OpenMPLoopConstruct &x);
@@ -251,6 +208,7 @@ private:
   bool CheckIntrinsicOperator(
       const parser::DefinedOperator::IntrinsicOperator &);
   void CheckReductionTypeList(const parser::OmpClause::Reduction &);
+  void CheckReductionModifier(const parser::OmpClause::Reduction &);
   void CheckMasterNesting(const parser::OpenMPBlockConstruct &x);
   void ChecksOnOrderedAsBlock();
   void CheckBarrierNesting(const parser::OpenMPSimpleStandaloneConstruct &x);
@@ -269,11 +227,19 @@ private:
   void CheckPredefinedAllocatorRestriction(
       const parser::CharBlock &source, const parser::Name &name);
   bool isPredefinedAllocator{false};
+
+  void CheckAllowedRequiresClause(llvmOmpClause clause);
+  bool deviceConstructFound_{false};
+
   void EnterDirectiveNest(const int index) { directiveNest_[index]++; }
   void ExitDirectiveNest(const int index) { directiveNest_[index]--; }
   int GetDirectiveNest(const int index) { return directiveNest_[index]; }
   template <typename D> void CheckHintClause(D *, D *);
-
+  inline void ErrIfAllocatableVariable(const parser::Variable &);
+  inline void ErrIfLHSAndRHSSymbolsMatch(
+      const parser::Variable &, const parser::Expr &);
+  inline void ErrIfNonScalarAssignmentStmt(
+      const parser::Variable &, const parser::Expr &);
   enum directiveNestType {
     SIMDNest,
     TargetBlockOnlyTeams,
@@ -281,6 +247,30 @@ private:
     LastType
   };
   int directiveNest_[LastType + 1] = {0};
+
+  SymbolSourceMap deferredNonVariables_;
 };
+
+template <typename T>
+const T *OmpStructureChecker::FindDuplicateEntry(const std::list<T> &list) {
+  // Add elements of the list to a set. If the insertion fails, return
+  // the address of the failing element.
+
+  // The objects of type T may not be copyable, so add their addresses
+  // to the set. The set will need to compare the actual objects, so
+  // the custom comparator is provided.
+  struct less {
+    bool operator()(const T *a, const T *b) const { return *a < *b; }
+  };
+  std::set<const T *, less> uniq;
+
+  for (const T &item : list) {
+    if (!uniq.insert(&item).second) {
+      return &item;
+    }
+  }
+  return nullptr;
+}
+
 } // namespace Fortran::semantics
 #endif // FORTRAN_SEMANTICS_CHECK_OMP_STRUCTURE_H_

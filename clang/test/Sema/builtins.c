@@ -40,7 +40,7 @@ void test9(short v) {
 
   old = __sync_fetch_and_add();  // expected-error {{too few arguments to function call}}
   old = __sync_fetch_and_add(&old);  // expected-error {{too few arguments to function call}}
-  old = __sync_fetch_and_add((unsigned*)0, 42i); // expected-warning {{imaginary constants are a GNU extension}}
+  old = __sync_fetch_and_add((unsigned*)0, 42i); // expected-warning {{imaginary constants are a C2y extension}}
 
   // PR7600: Pointers are implicitly casted to integers and back.
   void *old_ptr = __sync_val_compare_and_swap((void**)0, 0, 0);
@@ -128,7 +128,7 @@ struct foo x = (struct foo) { __builtin_constant_p(42) ? 37 : 927 };
 
 const int test17_n = 0;
 const char test17_c[] = {1, 2, 3, 0};
-const char test17_d[] = {1, 2, 3, 4};
+const char test17_d[] = {1, 2, 3, 4}; // Like test17_c but not NUL-terminated.
 typedef int __attribute__((vector_size(16))) IntVector;
 struct Aggregate { int n; char c; };
 enum Enum { EnumValue1, EnumValue2 };
@@ -171,13 +171,14 @@ void test17(void) {
 #define OPT(...) (__builtin_constant_p(__VA_ARGS__) && strlen(__VA_ARGS__) < 4)
   // FIXME: These are incorrectly treated as ICEs because strlen is treated as
   // a builtin.
-  ASSERT(OPT("abc"));
-  ASSERT(!OPT("abcd"));
+  ASSERT(OPT("abc")); // expected-warning {{expression is not an integer constant expression; folding it to a constant is a GNU extension}}
+  ASSERT(!OPT("abcd")); // expected-warning {{expression is not an integer constant expression; folding it to a constant is a GNU extension}}
   // In these cases, the strlen is non-constant, but the __builtin_constant_p
   // is 0: the array size is not an ICE but is foldable.
-  ASSERT(!OPT(test17_c));        // expected-warning {{folding}}
-  ASSERT(!OPT(&test17_c[0]));    // expected-warning {{folding}}
-  ASSERT(!OPT((char*)test17_c)); // expected-warning {{folding}}
+  ASSERT(!OPT(test17_c));
+  ASSERT(!OPT(&test17_c[0]));
+  ASSERT(!OPT((char*)test17_c));
+  // NOTE: test17_d is not NUL-termintated, so calling strlen on it is UB.
   ASSERT(!OPT(test17_d));        // expected-warning {{folding}}
   ASSERT(!OPT(&test17_d[0]));    // expected-warning {{folding}}
   ASSERT(!OPT((char*)test17_d)); // expected-warning {{folding}}
@@ -276,9 +277,9 @@ void test21(const int *ptr) {
 }
 
 void test_ei_i42i(_BitInt(42) *ptr, int value) {
-  __sync_fetch_and_add(ptr, value); // expected-error {{Atomic memory operand must have a power-of-two size}}
+  __sync_fetch_and_add(ptr, value); // expected-error {{atomic memory operand must have a power-of-two size}}
   // expected-warning@+1 {{the semantics of this intrinsic changed with GCC version 4.4 - the newer semantics are provided here}}
-  __sync_nand_and_fetch(ptr, value); // expected-error {{Atomic memory operand must have a power-of-two size}}
+  __sync_nand_and_fetch(ptr, value); // expected-error {{atomic memory operand must have a power-of-two size}}
 
   __atomic_fetch_add(ptr, 1, 0); // expected-error {{argument to atomic builtin of type '_BitInt' is not supported}}
 }
@@ -304,9 +305,9 @@ void test_ei_ii64(int *ptr, _BitInt(64) value) {
 }
 
 void test_ei_i42i42(_BitInt(42) *ptr, _BitInt(42) value) {
-  __sync_fetch_and_add(ptr, value); // expected-error {{Atomic memory operand must have a power-of-two size}}
+  __sync_fetch_and_add(ptr, value); // expected-error {{atomic memory operand must have a power-of-two size}}
   // expected-warning@+1 {{the semantics of this intrinsic changed with GCC version 4.4 - the newer semantics are provided here}}
-  __sync_nand_and_fetch(ptr, value); // expected-error {{Atomic memory operand must have a power-of-two size}}
+  __sync_nand_and_fetch(ptr, value); // expected-error {{atomic memory operand must have a power-of-two size}}
 }
 
 void test_ei_i64i64(_BitInt(64) *ptr, _BitInt(64) value) {

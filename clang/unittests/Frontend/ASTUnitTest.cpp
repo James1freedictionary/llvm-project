@@ -92,9 +92,8 @@ TEST_F(ASTUnitTest, SaveLoadPreservesLangOptionsInPrintingPolicy) {
   auto HSOpts = std::make_shared<HeaderSearchOptions>();
 
   std::unique_ptr<ASTUnit> AU = ASTUnit::LoadFromASTFile(
-      std::string(ASTFileName.str()), PCHContainerOps->getRawReader(),
-      ASTUnit::LoadEverything, Diags, FileSystemOptions(), HSOpts,
-      /*UseDebugInfo=*/false);
+      ASTFileName, PCHContainerOps->getRawReader(), ASTUnit::LoadEverything,
+      Diags, FileSystemOptions(), HSOpts);
 
   if (!AU)
     FAIL() << "failed to load ASTUnit";
@@ -151,8 +150,8 @@ TEST_F(ASTUnitTest, ModuleTextualHeader) {
   auto File = AU->getFileManager().getFileRef("Textual.h", false, false);
   ASSERT_TRUE(bool(File));
   // Verify that we do not crash here.
-  EXPECT_TRUE(AU->getPreprocessor().getHeaderSearchInfo().getExistingFileInfo(
-      &File->getFileEntry()));
+  EXPECT_TRUE(
+      AU->getPreprocessor().getHeaderSearchInfo().getExistingFileInfo(*File));
 }
 
 TEST_F(ASTUnitTest, LoadFromCommandLineEarlyError) {
@@ -169,9 +168,9 @@ TEST_F(ASTUnitTest, LoadFromCommandLineEarlyError) {
 
   std::unique_ptr<ASTUnit> AST = ASTUnit::LoadFromCommandLine(
       &Args[0], &Args[4], PCHContainerOps, Diags, "", false, "", false,
-      CaptureDiagsKind::All, std::nullopt, true, 0, TU_Complete, false, false,
-      false, SkipFunctionBodiesScope::None, false, true, false, false,
-      std::nullopt, &ErrUnit, nullptr);
+      CaptureDiagsKind::All, {}, true, 0, TU_Complete, false, false, false,
+      SkipFunctionBodiesScope::None, false, true, false, false, std::nullopt,
+      &ErrUnit, nullptr);
 
   ASSERT_EQ(AST, nullptr);
   ASSERT_NE(ErrUnit, nullptr);
@@ -196,9 +195,9 @@ TEST_F(ASTUnitTest, LoadFromCommandLineWorkingDirectory) {
 
   std::unique_ptr<ASTUnit> AST = ASTUnit::LoadFromCommandLine(
       &Args[0], &Args[4], PCHContainerOps, Diags, "", false, "", false,
-      CaptureDiagsKind::All, std::nullopt, true, 0, TU_Complete, false, false,
-      false, SkipFunctionBodiesScope::None, false, true, false, false,
-      std::nullopt, &ErrUnit, nullptr);
+      CaptureDiagsKind::All, {}, true, 0, TU_Complete, false, false, false,
+      SkipFunctionBodiesScope::None, false, true, false, false, std::nullopt,
+      &ErrUnit, nullptr);
 
   ASSERT_NE(AST, nullptr);
   ASSERT_FALSE(Diags->hasErrorOccurred());
